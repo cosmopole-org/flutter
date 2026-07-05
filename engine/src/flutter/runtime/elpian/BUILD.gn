@@ -1,0 +1,31 @@
+# Copyright 2013 The Flutter Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//flutter/common/config.gni")
+
+# The Elpian VM, built from the Rust crate `elpian-dart` as a static library.
+# Produced out-of-tree by:
+#   cd elpian && cargo build -p elpian-dart --release
+# and staged as libelpian_dart.a. This target links it and exposes the C ABI.
+config("elpian_vm_config") {
+  libs = [ "elpian_dart" ]
+  lib_dirs = [ rebase_path("//../../elpian/target/release") ]
+}
+
+source_set("elpian_runtime") {
+  sources = [
+    "elpian_ffi.h",
+    "elpian_runtime.cc",
+    "elpian_runtime.h",
+  ]
+
+  deps = [
+    "//flutter/display_list",
+    "//flutter/fml",
+    "//flutter/third_party/rapidjson",
+  ]
+
+  public_configs = [ "//flutter:config" ]
+  all_dependent_configs = [ ":elpian_vm_config" ]
+}
