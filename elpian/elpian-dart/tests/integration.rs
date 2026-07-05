@@ -696,3 +696,48 @@ fn dart_core_surface() {
         ]
     );
 }
+
+/// By-reference closure capture: a closure mutating an enclosing variable now
+/// propagates (via the box transform), so forEach-accumulator and closure-counter
+/// patterns work — the deepest previous correctness gap.
+#[test]
+fn dart_by_reference_closure_capture() {
+    let dart = r#"
+        int makeSum(List<int> xs) {
+            var total = 0;
+            xs.forEach((e) => total = total + e);
+            return total;
+        }
+        void main() {
+            askHost("test.emit", [makeSum([1, 2, 3, 4, 5])]);
+
+            var count = 0;
+            var bump = () { count = count + 1; };
+            bump();
+            bump();
+            bump();
+            askHost("test.emit", [count]);
+
+            // where + a captured filter threshold
+            var threshold = 2;
+            var kept = [1, 2, 3, 4].where((e) => e > threshold);
+            askHost("test.emit", [kept]);
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "byref_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    assert_eq!(
+        rt.emitted(),
+        &[
+            serde_json::json!(15),          // 1+2+3+4+5 via forEach mutation
+            serde_json::json!(3),           // closure counter
+            serde_json::json!([3, 4]),      // where with captured threshold
+        ]
+    );
+}
