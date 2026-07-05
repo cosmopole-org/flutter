@@ -63,6 +63,8 @@ pub struct DartRuntime {
     max_pump_tasks: u64,
     /// The scene the guest submitted via `FlutterView.render` this frame.
     current_frame: Option<Value>,
+    /// Class hierarchy for reified `is`/`as` checks over instances.
+    class_table: crate::types::ClassTable,
     emitted: Vec<Value>,
     log: Vec<String>,
     denied: Vec<String>,
@@ -94,6 +96,7 @@ impl DartRuntime {
             ports: crate::isolate::PortTable::new(),
             max_pump_tasks: DEFAULT_MAX_PUMP_TASKS,
             current_frame: None,
+            class_table: crate::types::ClassTable::new(),
             emitted: Vec::new(),
             log: Vec::new(),
             denied: Vec::new(),
@@ -109,8 +112,14 @@ impl DartRuntime {
         caps: DartCapabilitySet,
         meter: ResourceMeter,
     ) -> Result<Self, DartError> {
-        let js = crate::dart_frontend::transpile(dart_source).map_err(DartError::Frontend)?;
-        Self::from_js(machine_id, js, caps, meter)
+        let (js, classes) =
+            crate::dart_frontend::transpile_program(dart_source).map_err(DartError::Frontend)?;
+        let mut rt = Self::from_js(machine_id, js, caps, meter)?;
+        // Register the declared class hierarchy so reified is/as checks work.
+        for (name, superclass) in &classes {
+            rt.class_table.register(name, superclass.as_deref(), &[], &[]);
+        }
+        Ok(rt)
     }
 
     /// Pin the clock (and thus `DateTime.now`) for reproducible runs/tests.
@@ -306,6 +315,20 @@ impl DartRuntime {
             return Value::Null;
         }
 
+        // Reified is/as checks need the class hierarchy the runtime owns.
+        if library == "core" && (method == "isType" || method == "asType") {
+            let value = args.first().cloned().unwrap_or(Value::Null);
+            let ty = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            let ok = self.value_is_type(&value, ty);
+            return if method == "isType" {
+                Value::from(ok)
+            } else if ok {
+                value
+            } else {
+                dart_error(&format!("TypeError: value is not a {ty}"))
+            };
+        }
+
         let result = match library {
             "typed_data" => self.typed_data.dispatch(method, args),
             "ui" => self.ui.dispatch(method, args),
@@ -319,6 +342,29 @@ impl DartRuntime {
         match result {
             Ok(v) => v,
             Err(msg) => dart_error(&msg),
+        }
+    }
+
+    /// Reified `is`/`as`: check a runtime value against a type name. Primitive
+    /// types are checked against the JSON value's shape; class types are checked
+    /// against the instance's `__class` tag through the class hierarchy.
+    fn value_is_type(&self, value: &Value, ty: &str) -> bool {
+        match ty {
+            "Object" | "dynamic" => !value.is_null(),
+            "int" => value.is_i64() || value.is_u64(),
+            "double" => value.is_f64() && !(value.is_i64() || value.is_u64()),
+            "num" => value.is_number(),
+            "String" => value.is_string(),
+            "bool" => value.is_boolean(),
+            "List" => value.is_array(),
+            "Null" => value.is_null(),
+            class => {
+                // A tagged instance: use its most-derived class + the hierarchy.
+                match value.get("__class").and_then(|v| v.as_str()) {
+                    Some(actual) => self.class_table.is_subclass(actual, class),
+                    None => false,
+                }
+            }
         }
     }
 

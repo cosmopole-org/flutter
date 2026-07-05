@@ -381,3 +381,41 @@ fn runs_dart_inheritance() {
     rt.run().expect("runs");
     assert_eq!(rt.emitted(), &[serde_json::json!("few")]);
 }
+
+/// Deepen P4: reified `is`/`as` end-to-end — class-instance subtype checks via
+/// the runtime class hierarchy, plus primitive type tests, all from Dart source.
+#[test]
+fn reified_is_and_as_from_dart() {
+    let dart = r#"
+        class Animal { }
+        class Dog extends Animal { }
+        class Cat extends Animal { }
+        void main() {
+            Dog d = Dog();
+            askHost("test.emit", [d is Animal]);
+            askHost("test.emit", [d is Cat]);
+            askHost("test.emit", [5 is int]);
+            askHost("test.emit", ["hi" is String]);
+            Animal a = d as Animal;
+            askHost("test.emit", [a is Dog]);
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "isas_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    assert_eq!(
+        rt.emitted(),
+        &[
+            serde_json::json!(true),   // Dog is Animal
+            serde_json::json!(false),  // Dog is Cat
+            serde_json::json!(true),   // 5 is int
+            serde_json::json!(true),   // "hi" is String
+            serde_json::json!(true),   // (d as Animal) is Dog
+        ]
+    );
+}

@@ -35,6 +35,13 @@ pub enum TypeKind {
     List(Box<DartType>),
     /// A user-declared class `Name<args...>`.
     Interface(String, Vec<DartType>),
+    /// A function type `(params...) -> ret`.
+    Function {
+        ret: Box<DartType>,
+        params: Vec<DartType>,
+    },
+    /// A generic type parameter reference (e.g. `T`), resolved by substitution.
+    TypeParam(String),
 }
 
 /// A reified Dart type: a shape plus a nullability flag (`T` vs `T?`).
@@ -71,6 +78,38 @@ impl DartType {
     }
     pub fn interface(name: &str, args: Vec<DartType>) -> Self {
         DartType::new(TypeKind::Interface(name.to_string(), args), false)
+    }
+    pub fn function(ret: DartType, params: Vec<DartType>) -> Self {
+        DartType::new(TypeKind::Function { ret: Box::new(ret), params }, false)
+    }
+    pub fn type_param(name: &str) -> Self {
+        DartType::new(TypeKind::TypeParam(name.to_string()), false)
+    }
+
+    /// Substitute type parameters using `env` (e.g. instantiating `List<T>` with
+    /// `T=int`). Nullability is preserved across substitution.
+    pub fn substitute(&self, env: &std::collections::HashMap<String, DartType>) -> DartType {
+        let kind = match &self.kind {
+            TypeKind::TypeParam(name) => {
+                if let Some(t) = env.get(name) {
+                    // A nullable `T?` stays nullable after substitution.
+                    let mut r = t.clone();
+                    r.nullable = r.nullable || self.nullable;
+                    return r;
+                }
+                TypeKind::TypeParam(name.clone())
+            }
+            TypeKind::List(e) => TypeKind::List(Box::new(e.substitute(env))),
+            TypeKind::Interface(n, args) => {
+                TypeKind::Interface(n.clone(), args.iter().map(|a| a.substitute(env)).collect())
+            }
+            TypeKind::Function { ret, params } => TypeKind::Function {
+                ret: Box::new(ret.substitute(env)),
+                params: params.iter().map(|p| p.substitute(env)).collect(),
+            },
+            other => other.clone(),
+        };
+        DartType::new(kind, self.nullable)
     }
     /// The nullable version of this type (`T` -> `T?`).
     pub fn nullable(mut self) -> Self {
@@ -221,6 +260,12 @@ impl ClassTable {
             (Int, Num) | (Double, Num) => true,
             // Covariant List.
             (List(a), List(b)) => self.is_subtype(a, b),
+            // Function subtyping: covariant return, contravariant parameters.
+            (Function { ret: r1, params: p1 }, Function { ret: r2, params: p2 }) => {
+                p1.len() == p2.len()
+                    && self.is_subtype(r1, r2)
+                    && p1.iter().zip(p2).all(|(a, b)| self.is_subtype(b, a))
+            }
             // User interfaces: walk the hierarchy; args covariant when same arity.
             (Interface(n1, a1), Interface(n2, a2)) => {
                 if !self.is_subclass(n1, n2) {
@@ -414,6 +459,28 @@ mod tests {
             }
             _ => panic!("expected noSuchMethod"),
         }
+    }
+
+    #[test]
+    fn function_subtyping_is_variance_correct() {
+        let t = ClassTable::new();
+        // (num) -> int  <:  (int) -> num   (contravariant params, covariant ret)
+        let a = DartType::function(DartType::int(), vec![DartType::num()]);
+        let b = DartType::function(DartType::num(), vec![DartType::int()]);
+        assert!(t.is_subtype(&a, &b));
+        assert!(!t.is_subtype(&b, &a));
+    }
+
+    #[test]
+    fn generic_substitution_instantiates_type_params() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("T".to_string(), DartType::int());
+        // List<T> with T=int  ==  List<int>
+        let list_t = DartType::list(DartType::type_param("T"));
+        assert_eq!(list_t.substitute(&env), DartType::list(DartType::int()));
+        // Nullable T? stays nullable.
+        let nullable_t = DartType::type_param("T").nullable();
+        assert_eq!(nullable_t.substitute(&env), DartType::int().nullable());
     }
 
     #[test]

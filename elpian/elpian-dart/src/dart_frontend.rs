@@ -66,7 +66,7 @@ enum StrPart {
 
 const KEYWORDS: &[&str] = &[
     "var", "final", "if", "else", "while", "for", "return", "void", "int", "double", "num",
-    "String", "bool", "dynamic", "class", "extends", "this", "new", "super",
+    "String", "bool", "dynamic", "class", "extends", "this", "new", "super", "is", "as",
 ];
 
 // ---------------------------------------------------------------------------
@@ -385,6 +385,10 @@ enum Expr {
     This,
     /// Instantiation `ClassName(args)` — Dart has no `new` keyword required.
     New(String, Vec<Expr>),
+    /// `expr is Type` — a reified type test.
+    Is(Box<Expr>, String),
+    /// `expr as Type` — a reified cast.
+    As(Box<Expr>, String),
 }
 
 #[derive(Debug, Clone)]
@@ -669,6 +673,37 @@ impl Parser {
         }
     }
 
+    /// Parse a type name for `is`/`as`: a primitive keyword or a class ident.
+    /// Any generic arguments `<...>` are consumed and ignored (erased).
+    fn parse_type_name(&mut self) -> Result<String, String> {
+        let name = match self.bump() {
+            Tok::Ident(s) => s,
+            Tok::Kw(k) => k,
+            other => return Err(format!("expected a type name, found {other:?}")),
+        };
+        // Skip `<...>` generic arguments if present.
+        if *self.peek() == Tok::Op("<".into()) {
+            let mut depth = 0;
+            loop {
+                match self.peek() {
+                    Tok::Op(o) if o == "<" => depth += 1,
+                    Tok::Op(o) if o == ">" => {
+                        depth -= 1;
+                        self.bump();
+                        if depth == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    Tok::Eof => break,
+                    _ => {}
+                }
+                self.bump();
+            }
+        }
+        Ok(name)
+    }
+
     fn parse_block(&mut self) -> Result<Vec<Stmt>, String> {
         self.eat(&Tok::LBrace)?;
         let mut stmts = Vec::new();
@@ -822,7 +857,23 @@ impl Parser {
     }
 
     fn parse_ternary(&mut self) -> Result<Expr, String> {
-        let cond = self.parse_binary(0)?;
+        let mut cond = self.parse_binary(0)?;
+        // `is` / `as` bind tighter than `?:` but looser than the binary ops.
+        loop {
+            match self.peek() {
+                Tok::Kw(k) if k == "is" => {
+                    self.bump();
+                    let ty = self.parse_type_name()?;
+                    cond = Expr::Is(Box::new(cond), ty);
+                }
+                Tok::Kw(k) if k == "as" => {
+                    self.bump();
+                    let ty = self.parse_type_name()?;
+                    cond = Expr::As(Box::new(cond), ty);
+                }
+                _ => break,
+            }
+        }
         if *self.peek() == Tok::Question {
             self.bump();
             let then = self.parse_assign()?;
@@ -980,6 +1031,16 @@ const PRELUDE: &str = "function __truncDiv(a, b){ return (a - (a % b)) / b; }\n"
 
 /// Transpile Dart-subset source to the JS subset the Elpian VM ingests.
 pub fn transpile(dart: &str) -> Result<String, String> {
+    Ok(transpile_program(dart)?.0)
+}
+
+/// A declared class and its optional superclass (for building a runtime
+/// [`crate::types::ClassTable`]).
+pub type ClassInfo = (String, Option<String>);
+
+/// Transpile and also return the declared class hierarchy, so the runtime can
+/// answer reified `is`/`as` checks over the same class relationships.
+pub fn transpile_program(dart: &str) -> Result<(String, Vec<ClassInfo>), String> {
     let toks = Lexer::new(dart).tokenize()?;
     let class_names = {
         let mut set = std::collections::HashSet::new();
@@ -993,9 +1054,16 @@ pub fn transpile(dart: &str) -> Result<String, String> {
         set
     };
     let items = Parser::new(toks).parse_program()?;
+    let classes: Vec<ClassInfo> = items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Class(c) => Some((c.name.clone(), c.superclass.clone())),
+            _ => None,
+        })
+        .collect();
     let mut em = Emitter::new(class_names);
     em.emit_program(&items);
-    Ok(em.out)
+    Ok((em.out, classes))
 }
 
 /// Scope-aware emitter. Inside a class body it resolves bare field references to
@@ -1136,11 +1204,9 @@ impl Emitter {
         };
         self.out.push_str(&format!("class {}{} {{\n", c.name, ext));
 
-        let need_ctor = c.has_ctor
-            || c.calls_super
-            || !c.ctor_params.is_empty()
-            || c.fields.iter().any(|(_, init)| init.is_some());
-        if need_ctor {
+        // Always emit a constructor so every instance is tagged with its class
+        // name (used by the reified `is`/`as` checks host-side).
+        {
             let sig: Vec<String> = c.ctor_params.iter().map(|p| p.name.clone()).collect();
             self.out.push_str(&format!("  constructor({}) {{\n", sig.join(", ")));
             self.push_scope();
@@ -1150,6 +1216,8 @@ impl Emitter {
             if c.calls_super {
                 self.out.push_str("    super();\n");
             }
+            // Reified-type tag: most-derived ctor wins (runs last).
+            self.out.push_str(&format!("    this.__class = {};\n", json_string(&c.name)));
             // Field initializers run first; an initializing formal (`this.x`)
             // then wins, matching Dart's initialization order.
             for (fname, init) in &c.fields {
@@ -1310,6 +1378,12 @@ impl Emitter {
             Expr::New(name, args) => {
                 let a: Vec<String> = args.iter().map(|x| self.emit_expr(x)).collect();
                 format!("new {}({})", name, a.join(", "))
+            }
+            Expr::Is(x, ty) => {
+                format!("askHost(\"dart:core/isType\", [{}, {}])", self.emit_expr(x), json_string(ty))
+            }
+            Expr::As(x, ty) => {
+                format!("askHost(\"dart:core/asType\", [{}, {}])", self.emit_expr(x), json_string(ty))
             }
             Expr::Call(callee, args) => {
                 if let Expr::Ident(name) = &**callee {
