@@ -16,8 +16,10 @@
 //!   (`ClassName(args)`), member access, and `this`. Bare field/method
 //!   references inside methods resolve to `this.member` (including inherited
 //!   members), so idiomatic Dart lowers to valid JS classes;
-//! * `if`/`else`, `while`, C-style `for` (lowered to `while`), `return`, blocks;
-//! * expressions: literals, identifiers, calls, list literals, indexing,
+//! * `if`/`else`, `while`, C-style `for` and **`for-in`** (both lowered to
+//!   `while`), `return`, blocks;
+//! * expressions: literals (incl. **hex integers** `0xFF2196F3` for colours),
+//!   identifiers, calls, list literals, indexing,
 //!   assignment + compound assignment (`+= -= *= /=`), `++`/`--`, ternary
 //!   `?:`, `|| && == != < <= > >= + - * / % ~/`, unary `! -`;
 //! * string interpolation (`"$x"`, `"${expr}"`) lowered to concatenation;
@@ -36,6 +38,15 @@
 //! * **named & optional parameters** (`{this.width}`, `[int x = 0]`, `required`)
 //!   with defaults, lowered to a trailing options object; named arguments at
 //!   call sites; and **generic type args** in type positions (erased).
+//! * **idiomatic-Flutter surface**: metadata annotations (`@override`,
+//!   `@immutable`, …, dropped), `abstract`/soft class modifiers (erased),
+//!   `const` constructors/expressions (erased to plain instantiation), `enum`s
+//!   (lowered to an object mapping each constant to its name string), `static`
+//!   fields/methods and named constructors (reached as `Class.member`, backed by
+//!   the VM's static-member support), **getters** (`T get x => …`, emitted as a
+//!   method and called when read as `obj.x`), and the `??` null-coalescing
+//!   operator (lowered to a helper). A `void` arrow body (`void f() => g();`) is
+//!   a statement, not a `return`.
 //! * **`async`/`await`**: `async` functions are CPS-transformed to return a
 //!   `Future` built from `.then` continuations driven by the microtask loop;
 //!   `await` sequences them. Bounded: awaits are transformed only at statement
@@ -145,6 +156,12 @@ impl<'a> Lexer<'a> {
                 out.push(Tok::Eof);
                 return Ok(out);
             }
+            if c == b'@' {
+                // Metadata annotation (`@override`, `@immutable`, `@Foo(bar)`):
+                // consume it entirely at lex time so the parser never sees it.
+                self.skip_annotation();
+                continue;
+            }
             if c.is_ascii_alphabetic() || c == b'_' {
                 out.push(self.lex_ident());
             } else if c.is_ascii_digit() {
@@ -175,8 +192,62 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Consume a metadata annotation: `@`, a dotted identifier
+    /// (`Foo`, `Foo.bar`), and an optional balanced argument list `( ... )`.
+    /// Annotations carry no runtime meaning here, so they are dropped.
+    fn skip_annotation(&mut self) {
+        self.pos += 1; // '@'
+        // dotted identifier
+        loop {
+            while {
+                let c = self.peek();
+                c.is_ascii_alphanumeric() || c == b'_'
+            } {
+                self.pos += 1;
+            }
+            if self.peek() == b'.' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        self.skip_trivia();
+        if self.peek() == b'(' {
+            let mut depth = 0i32;
+            loop {
+                match self.peek() {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        self.pos += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    0 => break,
+                    _ => {}
+                }
+                self.pos += 1;
+            }
+        }
+    }
+
     fn lex_number(&mut self) -> Result<Tok, String> {
         let start = self.pos;
+        // Hex integer literal (`0xFF2196F3`) — common for ARGB colours.
+        if self.peek() == b'0' && (self.peek2() == b'x' || self.peek2() == b'X') {
+            self.pos += 2;
+            let hstart = self.pos;
+            while self.peek().is_ascii_hexdigit() {
+                self.pos += 1;
+            }
+            if self.pos == hstart {
+                return Err("bad hex literal".into());
+            }
+            let s = std::str::from_utf8(&self.src[hstart..self.pos]).unwrap();
+            return Ok(Tok::Int(i64::from_str_radix(s, 16).map_err(|_| "bad hex literal")?));
+        }
         let mut is_double = false;
         while self.peek().is_ascii_digit() {
             self.pos += 1;
@@ -286,7 +357,13 @@ impl<'a> Lexer<'a> {
             b',' => Tok::Comma,
             b';' => Tok::Semi,
             b'.' => Tok::Dot,
-            b'?' => Tok::Question,
+            b'?' => {
+                if two(b'?', b'?', self) {
+                    Tok::Op("??".into())
+                } else {
+                    Tok::Question
+                }
+            }
             b':' => Tok::Colon,
             b'+' => {
                 if two(b'+', b'+', self) {
@@ -468,6 +545,11 @@ struct Method {
     params: ParamList,
     body: Vec<Stmt>,
     is_async: bool,
+    /// A getter (`T get x => …`): declared with no parameters and read as a bare
+    /// member (`obj.x`), which the emitter rewrites to a call `obj.x()`.
+    is_getter: bool,
+    /// A `static` member: belongs to the class, reached as `Class.member`.
+    is_static: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -475,6 +557,8 @@ struct ClassDecl {
     name: String,
     superclass: Option<String>,
     fields: Vec<(String, Option<Expr>)>,
+    /// `static` fields (`static const foo = …`), reached as `Class.foo`.
+    static_fields: Vec<(String, Option<Expr>)>,
     ctor_params: ParamList,
     ctor_body: Vec<Stmt>,
     has_ctor: bool,
@@ -482,10 +566,19 @@ struct ClassDecl {
     methods: Vec<Method>,
 }
 
+/// A Dart `enum Name { a, b, c }`, lowered to a top-level object mapping each
+/// constant to its name string, so `Name.a` reads as a stable comparable value.
+#[derive(Debug, Clone)]
+struct EnumDecl {
+    name: String,
+    variants: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 enum Item {
     Func(String, ParamList, Vec<Stmt>, bool /* is_async */),
     Class(ClassDecl),
+    Enum(EnumDecl),
     Stmt(Stmt),
 }
 
@@ -497,6 +590,9 @@ struct Parser {
     toks: Vec<Tok>,
     i: usize,
     class_names: std::collections::HashSet<String>,
+    /// Monotonic counter for synthesizing unique temporaries (e.g. the iterator
+    /// and index locals a `for-in` loop desugars to).
+    for_seq: usize,
 }
 
 impl Parser {
@@ -511,7 +607,7 @@ impl Parser {
                 }
             }
         }
-        Parser { toks, i: 0, class_names }
+        Parser { toks, i: 0, class_names, for_seq: 0 }
     }
 
     fn peek(&self) -> &Tok {
@@ -545,11 +641,16 @@ impl Parser {
         Ok(items)
     }
 
-    /// A top-level item is a function declaration or a statement. Function form:
-    /// `[type] name ( params ) { body }` — detected by lookahead for `(...) {`.
+    /// A top-level item is a class, an enum, a function declaration, or a
+    /// statement. Class form may be prefixed with `abstract`/`final`/`base`/…
+    /// modifiers, which carry no runtime meaning here and are skipped.
     fn parse_item(&mut self) -> Result<Item, String> {
+        self.skip_class_modifiers();
         if *self.peek() == Tok::Kw("class".into()) {
             return Ok(Item::Class(self.parse_class()?));
+        }
+        if matches!(self.peek(), Tok::Ident(s) if s == "enum") {
+            return Ok(Item::Enum(self.parse_enum()?));
         }
         if self.looks_like_function() {
             return self.parse_function();
@@ -557,37 +658,161 @@ impl Parser {
         Ok(Item::Stmt(self.parse_stmt()?))
     }
 
+    /// Skip class-level soft modifiers (`abstract`, `final`, `base`, `interface`,
+    /// `sealed`, `mixin`) that may precede `class`. Only consumed when a `class`
+    /// keyword follows (possibly after more modifiers), so a plain identifier
+    /// named e.g. `final` in another position is untouched.
+    fn skip_class_modifiers(&mut self) {
+        let is_mod = |t: &Tok| match t {
+            Tok::Ident(s) => {
+                matches!(s.as_str(), "abstract" | "base" | "interface" | "sealed" | "mixin" | "final")
+            }
+            _ => false,
+        };
+        // Look ahead: a run of modifiers ending in `class`.
+        let mut k = 0;
+        while is_mod(self.peek_at(k)) {
+            k += 1;
+        }
+        if *self.peek_at(k) == Tok::Kw("class".into()) {
+            for _ in 0..k {
+                self.bump();
+            }
+        }
+    }
+
+    /// `enum Name { a, b, c }` (simple constant list; enhanced-enum bodies are
+    /// not supported). `with`/`implements` clauses are skipped.
+    fn parse_enum(&mut self) -> Result<EnumDecl, String> {
+        self.bump(); // 'enum'
+        let name = self.ident()?;
+        // Skip any `with`/`implements` clause up to the body.
+        while *self.peek() != Tok::LBrace && *self.peek() != Tok::Eof {
+            self.bump();
+        }
+        self.eat(&Tok::LBrace)?;
+        let mut variants = Vec::new();
+        while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof && *self.peek() != Tok::Semi {
+            variants.push(self.ident()?);
+            if *self.peek() == Tok::Comma {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        // Tolerate a trailing `;` + members block by skipping to the closing brace.
+        while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+            self.bump();
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(EnumDecl { name, variants })
+    }
+
     fn parse_class(&mut self) -> Result<ClassDecl, String> {
         self.bump(); // 'class'
         let name = self.ident()?;
+        // Skip generic type params `<T>` on the class name.
+        self.skip_generic_params();
         let superclass = if *self.peek() == Tok::Kw("extends".into()) {
             self.bump();
-            Some(self.ident()?)
+            let s = self.ident()?;
+            self.skip_generic_params();
+            Some(s)
         } else {
             None
         };
+        // Skip `with M1, M2` and `implements I1, I2` clauses (erased).
+        while matches!(self.peek(), Tok::Ident(s) if s == "with" || s == "implements") {
+            self.bump();
+            loop {
+                let _ = self.ident()?;
+                self.skip_generic_params();
+                if *self.peek() == Tok::Comma {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+        }
         self.eat(&Tok::LBrace)?;
         let mut fields = Vec::new();
+        let mut static_fields = Vec::new();
         let mut methods = Vec::new();
         let mut ctor_params = ParamList::default();
         let mut ctor_body = Vec::new();
         let mut has_ctor = false;
 
         while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
-            // Optional leading `var`/`final` or a type annotation (incl. generics).
-            if *self.peek() == Tok::Kw("var".into()) || *self.peek() == Tok::Kw("final".into()) {
-                self.bump();
-            } else {
-                self.maybe_skip_type();
+            // Member modifiers, in any order: static / const / final / late / var.
+            let mut is_static = false;
+            loop {
+                match self.peek() {
+                    Tok::Ident(s) if s == "static" => { is_static = true; self.bump(); }
+                    Tok::Ident(s) if s == "const" || s == "late" || s == "covariant" => { self.bump(); }
+                    Tok::Kw(s) if s == "final" || s == "var" => { self.bump(); }
+                    _ => break,
+                }
             }
+
+            // A getter: `[Type] get name => …` / `{ … }`.
+            let is_getter = matches!(self.peek(), Tok::Ident(s) if s == "get")
+                || (self.skip_type_at(0) > 0 && *self.peek_at(self.skip_type_at(0)) == Tok::Ident("get".into()));
+            if is_getter {
+                // Skip an optional return type, then the `get` keyword.
+                if !matches!(self.peek(), Tok::Ident(s) if s == "get") {
+                    self.maybe_skip_type();
+                }
+                self.bump(); // 'get'
+                let gname = self.ident()?;
+                let body = self.parse_fn_body(false)?;
+                methods.push(Method {
+                    name: gname,
+                    params: ParamList::default(),
+                    body,
+                    is_async: false,
+                    is_getter: true,
+                    is_static,
+                });
+                continue;
+            }
+
+            // Optional type annotation before the member name (fields/methods).
+            let ret_void = *self.peek() == Tok::Kw("void".into());
+            self.maybe_skip_type();
             let member_name = self.ident()?;
+
+            // A named constructor `ClassName.factoryName(...)` — lowered to a
+            // static factory method whose body may assign to a fresh `this`.
+            let named_ctor = member_name == name && *self.peek() == Tok::Dot;
+
+            if named_ctor {
+                self.bump(); // '.'
+                let ctor_name = self.ident()?;
+                let params = self.parse_param_list()?;
+                self.skip_initializers();
+                let body = if *self.peek() == Tok::Semi {
+                    self.bump();
+                    Vec::new()
+                } else {
+                    self.parse_block()?
+                };
+                methods.push(Method {
+                    name: ctor_name,
+                    params,
+                    body,
+                    is_async: false,
+                    is_getter: false,
+                    is_static: true,
+                });
+                continue;
+            }
+
             if *self.peek() == Tok::LParen {
-                // constructor or method
                 if member_name == name {
+                    // The unnamed constructor.
                     has_ctor = true;
                     ctor_params = self.parse_param_list()?;
-                    // A constructor body may be a block or just `;` (common with
-                    // initializing formals: `Counter(this.value);`).
+                    self.skip_initializers();
                     ctor_body = if *self.peek() == Tok::Semi {
                         self.bump();
                         Vec::new()
@@ -597,19 +822,45 @@ impl Parser {
                 } else {
                     let params = self.parse_param_list()?;
                     let is_async = self.eat_async_modifier();
-                    let body = self.parse_fn_body()?;
-                    methods.push(Method { name: member_name, params, body, is_async });
+                    let body = self.parse_fn_body(ret_void)?;
+                    methods.push(Method {
+                        name: member_name,
+                        params,
+                        body,
+                        is_async,
+                        is_getter: false,
+                        is_static,
+                    });
                 }
             } else {
-                // field: optional initializer, then ';'
+                // Field: optional initializer, then ';'. Additional comma-separated
+                // names share the type (`double left, top, right, bottom;`).
+                let mut names = vec![member_name];
                 let init = if *self.peek() == Tok::Op("=".into()) {
                     self.bump();
                     Some(self.parse_expr()?)
                 } else {
                     None
                 };
+                let mut extra: Vec<(String, Option<Expr>)> = Vec::new();
+                while *self.peek() == Tok::Comma {
+                    self.bump();
+                    let n = self.ident()?;
+                    let e = if *self.peek() == Tok::Op("=".into()) {
+                        self.bump();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    names.push(n.clone());
+                    extra.push((n, e));
+                }
                 self.eat(&Tok::Semi)?;
-                fields.push((member_name, init));
+                let target = if is_static { &mut static_fields } else { &mut fields };
+                target.push((names.remove(0), init));
+                for (n, e) in extra {
+                    target.push((n, e));
+                }
             }
         }
         self.eat(&Tok::RBrace)?;
@@ -618,12 +869,59 @@ impl Parser {
             name,
             superclass,
             fields,
+            static_fields,
             ctor_params,
             ctor_body,
             has_ctor,
             calls_super,
             methods,
         })
+    }
+
+    /// Skip a `<...>` generic-parameter/argument clause at the cursor, if present.
+    fn skip_generic_params(&mut self) {
+        if matches!(self.peek(), Tok::Op(o) if o == "<") {
+            let mut depth = 0i32;
+            loop {
+                match self.peek() {
+                    Tok::Op(o) if o == "<" => depth += 1,
+                    Tok::Op(o) if o == ">" => {
+                        depth -= 1;
+                        self.bump();
+                        if depth == 0 {
+                            return;
+                        }
+                        continue;
+                    }
+                    Tok::Eof => return,
+                    _ => {}
+                }
+                self.bump();
+            }
+        }
+    }
+
+    /// Skip a constructor initializer list: `: a = b, this.c = d, super(...)`.
+    /// The `field = value` initializers are erased (fields are assigned in the
+    /// body / via initializing formals in this subset); a `super(...)` call is
+    /// likewise dropped since the emitter always emits a bare `super()`.
+    fn skip_initializers(&mut self) {
+        if *self.peek() != Tok::Colon {
+            return;
+        }
+        // Consume everything up to the constructor body `{` or the terminating `;`.
+        let mut depth = 0i32;
+        loop {
+            match self.peek() {
+                Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RParen | Tok::RBracket => depth -= 1,
+                Tok::LBrace if depth == 0 => return,
+                Tok::Semi if depth == 0 => return,
+                Tok::Eof => return,
+                _ => {}
+            }
+            self.bump();
+        }
     }
 
     /// Non-consuming: index just past an optional type (keyword or identifier,
@@ -708,11 +1006,12 @@ impl Parser {
     }
 
     fn parse_function(&mut self) -> Result<Item, String> {
+        let is_void = *self.peek() == Tok::Kw("void".into());
         self.maybe_skip_type(); // optional return type (incl. generics)
         let name = self.ident()?;
         let params = self.parse_param_list()?;
         let is_async = self.eat_async_modifier();
-        let body = self.parse_fn_body()?;
+        let body = self.parse_fn_body(is_void)?;
         Ok(Item::Func(name, params, body, is_async))
     }
 
@@ -866,6 +1165,18 @@ impl Parser {
             Tok::LBrace => Ok(Stmt::Block(self.parse_block()?)),
             Tok::Kw(k) if k == "var" || k == "final" => {
                 self.bump();
+                self.maybe_skip_type();
+                self.parse_var_tail()
+            }
+            // `const` / `late` (contextual) declaration modifiers, alone or with a
+            // type: `const double x = 8.0;`, `late final Foo y = ...;`.
+            Tok::Ident(s) if s == "const" || s == "late" => {
+                while matches!(self.peek(), Tok::Ident(x) if x == "const" || x == "late")
+                    || matches!(self.peek(), Tok::Kw(x) if x == "final" || x == "var")
+                {
+                    self.bump();
+                }
+                self.maybe_skip_type();
                 self.parse_var_tail()
             }
             Tok::Kw(k) if matches!(k.as_str(), "int" | "double" | "num" | "String" | "bool") => {
@@ -940,6 +1251,10 @@ impl Parser {
     fn parse_for(&mut self) -> Result<Stmt, String> {
         self.bump();
         self.eat(&Tok::LParen)?;
+        // A `for-in` header has no top-level `;` before the closing `)`.
+        if self.header_is_for_in() {
+            return self.parse_for_in();
+        }
         let init = if *self.peek() == Tok::Semi {
             self.bump();
             None
@@ -969,6 +1284,92 @@ impl Parser {
         }
         block.push(while_stmt);
         Ok(Stmt::Block(block))
+    }
+
+    /// True if the tokens from the current position (just past `for (`) are a
+    /// `for-in` header — i.e. there is no top-level `;` before the matching `)`.
+    fn header_is_for_in(&self) -> bool {
+        let mut k = 0usize;
+        let mut depth = 0i32;
+        loop {
+            match self.peek_at(k) {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    if depth == 0 {
+                        return true;
+                    }
+                    depth -= 1;
+                }
+                Tok::Semi if depth == 0 => return false,
+                Tok::Eof => return false,
+                _ => {}
+            }
+            k += 1;
+        }
+    }
+
+    /// Parse `for (<var> in <iterable>) <body>` and desugar it to an indexed
+    /// `while` over `<iterable>.length`, re-declaring the loop variable each
+    /// iteration (Dart's closure-capture semantics). The `(` is already consumed.
+    fn parse_for_in(&mut self) -> Result<Stmt, String> {
+        // Optional `var` / `final`.
+        if matches!(self.peek(), Tok::Kw(k) if k == "var" || k == "final") {
+            self.bump();
+        }
+        // Optional type annotation: only skip it when a type is followed by the
+        // loop-variable identifier which is itself followed by `in` — so a bare
+        // `name in` is never mistaken for a `Type name`.
+        let in_tok = Tok::Ident("in".into());
+        let after_type = self.skip_type_at(0);
+        let has_type = after_type > 0
+            && matches!(self.peek_at(after_type), Tok::Ident(_))
+            && self.peek_at(after_type) != &in_tok
+            && self.peek_at(after_type + 1) == &in_tok;
+        if has_type {
+            for _ in 0..after_type {
+                self.bump();
+            }
+        }
+        let name = match self.bump() {
+            Tok::Ident(n) => n,
+            other => return Err(format!("for-in expected a loop variable, found {other:?}")),
+        };
+        self.eat(&in_tok)?;
+        let iter = self.parse_expr()?;
+        self.eat(&Tok::RParen)?;
+        let mut body = self.stmt_as_block()?;
+
+        let n = self.for_seq;
+        self.for_seq += 1;
+        let it = format!("__for_it{n}");
+        let idx = format!("__for_i{n}");
+        let idx_read = || Expr::Ident(idx.clone());
+
+        // var name = __forIt[__forI];
+        let mut loop_body = vec![Stmt::Var(
+            name,
+            Some(Expr::Index(
+                Box::new(Expr::Ident(it.clone())),
+                Box::new(idx_read()),
+            )),
+        )];
+        loop_body.append(&mut body);
+        // __forI = __forI + 1;
+        loop_body.push(Stmt::Expr(Expr::Assign(
+            Box::new(idx_read()),
+            Box::new(Expr::Binary("+".into(), Box::new(idx_read()), Box::new(Expr::Int(1)))),
+        )));
+
+        let cond = Expr::Binary(
+            "<".into(),
+            Box::new(idx_read()),
+            Box::new(Expr::Member(Box::new(Expr::Ident(it.clone())), "length".into())),
+        );
+        Ok(Stmt::Block(vec![
+            Stmt::Var(it, Some(iter)),
+            Stmt::Var(idx, Some(Expr::Int(0))),
+            Stmt::While(cond, loop_body),
+        ]))
     }
 
     fn stmt_as_block(&mut self) -> Result<Vec<Stmt>, String> {
@@ -1079,12 +1480,20 @@ impl Parser {
 
     fn parse_closure(&mut self) -> Result<Expr, String> {
         let params = self.parse_param_list()?;
-        let body = self.parse_fn_body()?;
+        let body = self.parse_fn_body(false)?;
         Ok(Expr::Closure(params, body))
     }
 
-    /// A function/method body: a block, or an arrow body `=> expr;`.
-    fn parse_fn_body(&mut self) -> Result<Vec<Stmt>, String> {
+    /// A function/method body: a block, or an arrow body `=> expr;`. `is_void`
+    /// is true for a `void`-returning declaration, whose arrow body is a
+    /// *statement* (it must not `return` a value — `void f() => g();` runs `g()`
+    /// for effect).
+    fn parse_fn_body(&mut self, is_void: bool) -> Result<Vec<Stmt>, String> {
+        // An abstract / external declaration has no body, just `;`.
+        if *self.peek() == Tok::Semi {
+            self.bump();
+            return Ok(Vec::new());
+        }
         if *self.peek() == Tok::Op("=>".into()) {
             self.bump();
             let e = self.parse_expr()?;
@@ -1093,11 +1502,12 @@ impl Parser {
             if *self.peek() == Tok::Semi {
                 self.bump();
             }
-            // Elpian treats assignment / update as a statement, not an expression,
-            // so `=> x = v` (common in `forEach`) becomes a statement body rather
-            // than `return (x = v)`, which the VM rejects.
+            // A void body, or an assignment/update (which Elpian treats as a
+            // statement, not an expression), becomes a statement rather than
+            // `return <expr>`.
             let stmt = match e {
                 Expr::Assign(..) | Expr::AssignOp(..) | Expr::Update(..) => Stmt::Expr(e),
+                _ if is_void => Stmt::Expr(e),
                 _ => Stmt::Return(Some(e)),
             };
             Ok(vec![stmt])
@@ -1107,6 +1517,12 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
+        // `const` before an expression (`const Text(...)`, `const [...]`,
+        // `const EdgeInsets.all(8)`) is erased — const-ness is not modelled.
+        if matches!(self.peek(), Tok::Ident(s) if s == "const") {
+            self.bump();
+            return self.parse_unary();
+        }
         if self.looks_like_lambda() {
             return self.parse_closure();
         }
@@ -1226,6 +1642,7 @@ impl Parser {
 
 fn binding_power(op: &str) -> Option<u8> {
     Some(match op {
+        "??" => 0,
         "||" => 1,
         "&&" => 2,
         "==" | "!=" => 3,
@@ -1247,6 +1664,7 @@ fn binding_power(op: &str) -> Option<u8> {
 /// `out.add(...)`, and closure calls — all VM-supported.
 const PRELUDE: &str = concat!(
     "function __truncDiv(a, b){ return (a - (a % b)) / b; }\n",
+    "function __ifNull(a, b){ if (a != null) { return a; } return b; }\n",
     "function __List_map(f){ var out = []; var i = 0; while (i < this.length) { out.add(f(this[i])); i = i + 1; } return out; }\n",
     "function __List_where(f){ var out = []; var i = 0; while (i < this.length) { if (f(this[i])) { out.add(this[i]); } i = i + 1; } return out; }\n",
     "function __List_forEach(f){ var i = 0; while (i < this.length) { f(this[i]); i = i + 1; } return null; }\n",
@@ -1330,6 +1748,7 @@ fn box_captured_program(items: &mut [Item]) {
                     box_captured_fn(&mut m.body);
                 }
             }
+            Item::Enum(_) => {}
             Item::Stmt(_) => {}
         }
     }
@@ -1633,9 +2052,21 @@ struct Emitter {
     method_map: NameMap,
     fields: NameSet,
     methods: NameSet,
+    /// Instance getter names (across all classes) that should be *called* when
+    /// read as a bare member `obj.name` → `obj.name()`. Excludes names that are
+    /// also fields somewhere, or native properties, to avoid mis-calling those.
+    getters: NameSet,
     locals: Vec<NameSet>,
     in_class: bool,
 }
+
+/// Native member names the VM binds as properties (not zero-arg getters), which
+/// must never be rewritten to a call even if a user class declares a like-named
+/// getter.
+const NATIVE_PROPS: &[&str] = &[
+    "length", "isEmpty", "isNotEmpty", "first", "last", "single", "keys", "values",
+    "reversed", "iterator", "runtimeType", "hashCode",
+];
 
 impl Emitter {
     fn new(class_names: NameSet) -> Self {
@@ -1646,6 +2077,7 @@ impl Emitter {
             method_map: Default::default(),
             fields: Default::default(),
             methods: Default::default(),
+            getters: Default::default(),
             locals: Vec::new(),
             in_class: false,
         }
@@ -1657,17 +2089,46 @@ impl Emitter {
         let mut own_fields: NameMap = Default::default();
         let mut own_methods: NameMap = Default::default();
         let mut supers: std::collections::HashMap<String, Option<String>> = Default::default();
+        let mut all_getters = NameSet::new();
+        let mut all_fields = NameSet::new();
         for item in items {
             if let Item::Class(c) = item {
                 own_fields.insert(c.name.clone(), c.fields.iter().map(|(n, _)| n.clone()).collect());
-                own_methods.insert(c.name.clone(), c.methods.iter().map(|m| m.name.clone()).collect());
+                // Only *instance*, non-getter methods participate in bare-name
+                // `this.method` resolution; statics are reached as `Class.m`.
+                own_methods.insert(
+                    c.name.clone(),
+                    c.methods
+                        .iter()
+                        .filter(|m| !m.is_static && !m.is_getter)
+                        .map(|m| m.name.clone())
+                        .collect(),
+                );
                 // `this.x` params are also fields.
                 if let Some(set) = own_fields.get_mut(&c.name) {
                     for p in c.ctor_params.all_this_params() {
                         set.insert(p.name.clone());
                     }
                 }
+                for (n, _) in &c.fields {
+                    all_fields.insert(n.clone());
+                }
+                for p in c.ctor_params.all_this_params() {
+                    all_fields.insert(p.name.clone());
+                }
+                for m in &c.methods {
+                    if m.is_getter && !m.is_static {
+                        all_getters.insert(m.name.clone());
+                    }
+                }
                 supers.insert(c.name.clone(), c.superclass.clone());
+            }
+        }
+        // A getter is call-rewritten only if it is unambiguous: never also a
+        // field, never a native property.
+        for g in all_getters {
+            if !all_fields.contains(&g) && !NATIVE_PROPS.contains(&g.as_str()) {
+                self.getters.insert(g);
             }
         }
         // Walk the superclass chain for each class.
@@ -1799,6 +2260,7 @@ impl Emitter {
                     self.out.push_str("}\n");
                 }
                 Item::Class(c) => self.emit_class(c),
+                Item::Enum(e) => self.emit_enum(e),
                 Item::Stmt(s) => self.emit_stmt(s, 0),
             }
         }
@@ -1852,16 +2314,36 @@ impl Emitter {
             self.out.push_str("  }\n");
         }
 
+        // Static fields belong to the class, reached as `Class.field`.
+        for (fname, init) in &c.static_fields {
+            let v = init.as_ref().map(|e| self.emit_expr(e)).unwrap_or_else(|| "null".into());
+            self.out.push_str(&format!("  static {fname} = {v};\n"));
+        }
+
         for m in &c.methods {
             let sig = self.param_sig(&m.params);
-            self.out.push_str(&format!("  {}({}) {{\n", m.name, sig.join(", ")));
+            let prefix = if m.is_static { "static " } else { "" };
+            self.out.push_str(&format!("  {}{}({}) {{\n", prefix, m.name, sig.join(", ")));
             self.push_scope();
             self.declare_params(&m.params);
+            // Inside a static member `this`/instance-field resolution is invalid;
+            // suppress it so bare names stay bare (they refer to locals / statics).
+            let saved_in_class = self.in_class;
+            let saved_fields = if m.is_static { std::mem::take(&mut self.fields) } else { NameSet::new() };
+            let saved_methods = if m.is_static { std::mem::take(&mut self.methods) } else { NameSet::new() };
+            if m.is_static {
+                self.in_class = false;
+            }
             self.emit_param_prologue(&m.params, 2);
             if m.is_async {
                 self.emit_async_seq(&m.body, 2);
             } else {
                 self.emit_stmts(&m.body, 2);
+            }
+            if m.is_static {
+                self.in_class = saved_in_class;
+                self.fields = saved_fields;
+                self.methods = saved_methods;
             }
             self.pop_scope();
             self.out.push_str("  }\n");
@@ -1871,6 +2353,17 @@ impl Emitter {
         self.in_class = false;
         self.fields.clear();
         self.methods.clear();
+    }
+
+    /// Emit an enum as a top-level object mapping each constant to its name
+    /// string, so `Name.a` is a stable, comparable value.
+    fn emit_enum(&mut self, e: &EnumDecl) {
+        let pairs: Vec<String> = e
+            .variants
+            .iter()
+            .map(|v| format!("{}: {}", v, json_string(v)))
+            .collect();
+        self.out.push_str(&format!("var {} = {{{}}};\n", e.name, pairs.join(", ")));
     }
 
     fn emit_stmts(&mut self, stmts: &[Stmt], depth: usize) {
@@ -2043,6 +2536,8 @@ impl Emitter {
             Expr::Binary(op, a, b) => {
                 if op == "~/" {
                     format!("__truncDiv({}, {})", self.emit_expr(a), self.emit_expr(b))
+                } else if op == "??" {
+                    format!("__ifNull({}, {})", self.emit_expr(a), self.emit_expr(b))
                 } else {
                     format!("({} {} {})", self.emit_expr(a), op, self.emit_expr(b))
                 }
@@ -2059,10 +2554,16 @@ impl Emitter {
                 let o = self.emit_expr(obj);
                 // A numeric-literal receiver needs parens: `7.clamp` would lex as
                 // the float `7.` followed by `clamp`.
-                if matches!(&**obj, Expr::Int(_) | Expr::Double(_)) {
+                let base = if matches!(&**obj, Expr::Int(_) | Expr::Double(_)) {
                     format!("({o}).{name}")
                 } else {
                     format!("{o}.{name}")
+                };
+                // A bare read of a getter invokes it (`obj.x` -> `obj.x()`).
+                if self.getters.contains(name) {
+                    format!("{base}()")
+                } else {
+                    base
                 }
             }
             Expr::New(name, pos, named) => {
@@ -2129,11 +2630,23 @@ impl Emitter {
                         return format!("this.{}({})", name, a.join(", "));
                     }
                 }
-                let c = self.emit_expr(callee);
                 let mut a: Vec<String> = pos.iter().map(|x| self.emit_expr(x)).collect();
                 if !named.is_empty() {
                     a.push(self.emit_named_object(named));
                 }
+                // A method call on a member is emitted directly, so getter
+                // call-rewriting (which fires for a *read* `obj.x`) does not turn
+                // `obj.m(args)` into `obj.m()(args)`.
+                if let Expr::Member(obj, name) = &**callee {
+                    let o = self.emit_expr(obj);
+                    let recv = if matches!(&**obj, Expr::Int(_) | Expr::Double(_)) {
+                        format!("({o})")
+                    } else {
+                        o
+                    };
+                    return format!("{}.{}({})", recv, name, a.join(", "));
+                }
+                let c = self.emit_expr(callee);
                 format!("{}({})", c, a.join(", "))
             }
         }
@@ -2201,6 +2714,75 @@ mod tests {
         let js = transpile(r#"var s = "n=$x done";"#).unwrap();
         assert!(js.contains('+'), "interpolation should concat: {js}");
         assert!(js.contains("(x)"), "should reference x: {js}");
+    }
+
+    #[test]
+    fn annotations_abstract_and_const_are_erased() {
+        let dart = "@immutable\nabstract class Shape { const Shape(); }\n\
+                    var s = const Shape();";
+        let js = transpile(dart).unwrap();
+        assert!(js.contains("class Shape"), "abstract erased to a class: {js}");
+        assert!(!js.contains('@'), "annotation stripped: {js}");
+        assert!(js.contains("new Shape()"), "const erased to instantiation: {js}");
+    }
+
+    #[test]
+    fn statics_getters_and_named_constructors() {
+        let dart = "class Color {\n\
+                      final int value;\n\
+                      const Color(this.value);\n\
+                      static const int black = 4278190080;\n\
+                      static Color fromValue(int v) => Color(v);\n\
+                      int get red => (value ~/ 65536) % 256;\n\
+                    }";
+        let js = transpile(dart).unwrap();
+        assert!(js.contains("static black = 4278190080"), "static field: {js}");
+        assert!(js.contains("static fromValue"), "static method: {js}");
+        // A getter is emitted as a method and *called* when read as a bare member.
+        assert!(js.contains("red("), "getter emitted as method: {js}");
+    }
+
+    #[test]
+    fn enum_lowers_to_name_object() {
+        let js = transpile("enum Axis { horizontal, vertical }").unwrap();
+        assert!(
+            js.contains("var Axis = {horizontal: \"horizontal\", vertical: \"vertical\"}"),
+            "enum -> name object: {js}"
+        );
+    }
+
+    #[test]
+    fn null_coalescing_lowers_to_helper() {
+        let js = transpile("var x = a ?? 5;").unwrap();
+        assert!(js.contains("__ifNull("), "?? -> __ifNull: {js}");
+    }
+
+    #[test]
+    fn void_arrow_body_is_a_statement_not_a_return() {
+        // A void arrow function must not `return` its call's value.
+        let js = transpile("void main() => run();").unwrap();
+        assert!(js.contains("function main"), "got: {js}");
+        assert!(!js.contains("return run()"), "void arrow must be a statement: {js}");
+    }
+
+    #[test]
+    fn hex_integer_literals_lex() {
+        let js = transpile("var c = 0xFF2196F3;").unwrap();
+        assert!(js.contains("4280391411"), "hex parsed to its value: {js}");
+    }
+
+    #[test]
+    fn for_in_desugars_to_indexed_while() {
+        // Typed loop var, bare form, and a C-style `for` in the same program all
+        // parse; the for-in lowers to a length-bounded while over the iterable.
+        let js = transpile(
+            "void main() { for (var x in xs) { total = total + x; } \
+             for (int i = 0; i < 3; i = i + 1) { print(i); } }",
+        )
+        .unwrap();
+        assert!(js.contains("__for_it0"), "for-in should bind an iterator temp: {js}");
+        assert!(js.contains(".length"), "for-in should bound on length: {js}");
+        assert!(js.contains("while"), "for-in lowers to while: {js}");
     }
 
     #[test]

@@ -1,0 +1,70 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Elpian — a Flutter app (import 'flutter.dart') on the VM</title>
+  <style>
+    body { background: #0b0d14; color: #cbd5e1; font-family: system-ui, sans-serif; margin: 16px; }
+    h3 { font-weight: 600; }
+    canvas { background: #12141c; border: 1px solid #2a2e3e; border-radius: 8px; cursor: pointer; }
+    code { color: #7dd3fc; }
+  </style>
+</head>
+<body>
+  <h3>A real Flutter app — <code>import 'flutter.dart'</code>, <code>StatefulWidget</code>, <code>setState</code> — compiled to Elpian bytecode and run on the VM. Click the +/- buttons.</h3>
+  <canvas id="c" width="400" height="800"></canvas>
+  <script type="module">
+    function argb(c) {
+      const a = Math.floor(c / 16777216) % 256, r = Math.floor(c / 65536) % 256;
+      const g = Math.floor(c / 256) % 256, b = c % 256;
+      return `rgba(${r},${g},${b},${a / 255})`;
+    }
+    function paint(ctx, scene) {
+      ctx.clearRect(0, 0, 400, 800);
+      for (const op of (scene.root && scene.root.ops) || []) {
+        ctx.fillStyle = argb(op.color);
+        if (op.op === 'drawRect') { const [l, t, r, b] = op.rect; ctx.fillRect(l, t, r - l, b - t); }
+        else if (op.op === 'drawCircle') { const [x, y] = op.center; ctx.beginPath(); ctx.arc(x, y, op.radius, 0, 7); ctx.fill(); }
+        else if (op.op === 'drawParagraph') {
+          const [x, y] = op.offset;
+          const weight = op.fontWeight === 'bold' ? '700 ' : '';
+          ctx.font = `${weight}${op.fontSize}px system-ui, sans-serif`;
+          ctx.fillText(op.text, x, y);
+        }
+      }
+    }
+    let ex, ctx;
+    function readResult() {
+      const rptr = ex.elpian_result_ptr();
+      return JSON.parse(new TextDecoder().decode(new Uint8Array(ex.memory.buffer, rptr, window.__lastLen)));
+    }
+    function frame() { window.__lastLen = ex.elpian_frame(); window.__scene = readResult(); paint(ctx, window.__scene); }
+    async function main() {
+      const [wasmBytes, src] = await Promise.all([
+        fetch('elpian_dart.wasm').then(r => r.arrayBuffer()),
+        fetch('demo_app.dart').then(r => r.text()),
+      ]);
+      const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+      ex = instance.exports;
+      ctx = document.getElementById('c').getContext('2d', { willReadFrequently: true });
+      const enc = new TextEncoder().encode(src);
+      const ptr = ex.elpian_alloc(enc.length);
+      new Uint8Array(ex.memory.buffer, ptr, enc.length).set(enc);
+      // Load the app the same way the engine's elpian_init_flutter does: the
+      // flutter.dart library is baked into the wasm and prepended.
+      ex.elpian_init_flutter(ptr, enc.length);
+      frame();
+      const canvas = document.getElementById('c');
+      canvas.addEventListener('click', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left, y = e.clientY - rect.top;
+        ex.elpian_pointer(x, y, 1); // down
+        ex.elpian_pointer(x, y, 0); // up (GestureDetector.onTap fires on up)
+        frame();
+      });
+      window.__ready = true;
+    }
+    main().catch((e) => { window.__error = String(e); });
+  </script>
+</body>
+</html>

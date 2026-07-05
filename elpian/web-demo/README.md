@@ -49,6 +49,33 @@ keeps VM state across frames.
 node interactive_test.mjs    # clicks the button, asserts the bar grows -> INTERACTIVE E2E PASSED
 ```
 
+### Real widget-code variant
+
+`widgets_app.dart` + `widgets.html` + `widgets_test.mjs` run an app authored as
+**actual Flutter-style widgets** — no raw `dart:ui` calls, just
+`StatelessWidget`/`StatefulWidget`, `build()`, nested children, and a
+`GestureDetector`. The widget framework (prepended via the `elpian_init_widgets`
+export) builds, lays out, and paints the tree into the same scene the canvas
+rasterizes; real clicks run `onTap → setState` and the next frame reflects the
+new state.
+
+```sh
+node widgets_test.mjs        # taps the widget button, asserts the bar tracks state -> WIDGETS E2E PASSED
+```
+
+### Full `flutter.dart` app variant
+
+`flutter.html` + `flutter_test.mjs` run [`demo_app.dart`](../elpian-dart/flutter/demo_app.dart)
+— a realistic app that `import 'flutter.dart'` (the full idiomatic widget
+library) and builds a `MaterialApp` → `Scaffold` → `AppBar` with a counter
+`Card`, `+`/`-` `ElevatedButton`s, a progress bar, and stat chips. The library
+is baked into the wasm and prepended by the `elpian_init_flutter` export; real
+clicks drive `setState` and the Material UI repaints.
+
+```sh
+node flutter_test.mjs        # taps +/-, asserts the counter/derived stats update -> FLUTTER APP E2E PASSED
+```
+
 ## Honest scope
 
 This is the **Elpian renderer**, not Flutter's CanvasKit/WebGL engine. It proves

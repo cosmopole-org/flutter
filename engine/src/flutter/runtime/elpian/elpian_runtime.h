@@ -33,6 +33,18 @@ class ElpianRuntime {
   // defining its handlers. Returns false on compile/load failure.
   bool LoadBundle(const std::string& source);
 
+  // Compile + run a bundle authored as a *Flutter-style widget app* — a program
+  // of StatelessWidget/StatefulWidget classes with build() methods and a main()
+  // that calls runApp(...). The widget framework is prepended by the VM layer,
+  // so the guest's handlers build/lay out/paint the widget tree and route taps.
+  // Returns false on compile/load failure.
+  bool LoadWidgetApp(const std::string& source);
+
+  // Compile + run an app authored against the full flutter.dart library
+  // (`import 'flutter.dart';`) — the idiomatic widget/painting library, which is
+  // concatenated ahead of the app by the VM layer. Returns false on failure.
+  bool LoadFlutterApp(const std::string& source);
+
   // Deliver a pointer event to the guest's `onPointerEvent` handler.
   void DispatchPointer(double x, double y, bool down);
 
