@@ -14,10 +14,23 @@ use serde_json::{json, Value};
 use elpian_vm::api::{self, VmExecResult};
 use elpian_vm::sdk::capabilities::Capability;
 
+use crate::async_loop::EventLoop;
 use crate::core::{Clock, CoreRuntime};
 use crate::dart_ui::SceneRecorder;
 use crate::governance::{required_capability, DartCapability, DartCapabilitySet, ResourceMeter};
 use crate::typed_data::TypedDataStore;
+
+/// Name of the guest entrypoint the runtime invokes to run a scheduled callback.
+/// The guest (or generated Dart glue) defines
+/// `function __dartDispatch(args) { /* args = [cbId, value] */ }` and routes to
+/// its own closure table. This is the single seam through which `Future`/`Timer`
+/// continuations re-enter guest code.
+const DISPATCH_FN: &str = "__dartDispatch";
+
+/// Safety bound on a single `run()`'s event-loop pump, so a guest that endlessly
+/// reschedules microtasks cannot hang the host. Complements the VM instruction
+/// limit and the [`ResourceMeter`].
+const DEFAULT_MAX_PUMP_TASKS: u64 = 1_000_000;
 
 /// Error creating or driving a runtime.
 #[derive(Debug)]
@@ -26,6 +39,8 @@ pub enum DartError {
     Compile,
     /// The VM registry lost the instance.
     VmNotFound,
+    /// The event-loop pump exceeded its per-run task budget (runaway guest).
+    PumpBudgetExceeded,
 }
 
 /// A single embedded Dart runtime instance.
@@ -36,6 +51,8 @@ pub struct DartRuntime {
     typed_data: TypedDataStore,
     ui: SceneRecorder,
     core: CoreRuntime,
+    events: EventLoop,
+    max_pump_tasks: u64,
     emitted: Vec<Value>,
     log: Vec<String>,
     denied: Vec<String>,
@@ -63,6 +80,8 @@ impl DartRuntime {
             typed_data: TypedDataStore::new(),
             ui: SceneRecorder::new(),
             core: CoreRuntime::new(Clock::System),
+            events: EventLoop::new(),
+            max_pump_tasks: DEFAULT_MAX_PUMP_TASKS,
             emitted: Vec::new(),
             log: Vec::new(),
             denied: Vec::new(),
@@ -106,17 +125,50 @@ impl DartRuntime {
         }
     }
 
-    /// Drive the VM to completion, servicing every host call. Returns the
-    /// top-level result value (usually a status string).
+    /// Run the guest's top-level program, then pump the event loop until it is
+    /// idle — so scheduled microtasks and timers (i.e. `Future`/`Timer`/`async`
+    /// continuations) run, exactly as a Dart isolate does before it exits.
     pub fn run(&mut self) -> Result<Value, DartError> {
-        let mut res = api::execute_vm(self.machine_id.clone());
+        let result = self.drive(api::execute_vm(self.machine_id.clone()));
+        self.pump()?;
+        Ok(result)
+    }
+
+    /// Drive a single VM turn to completion, servicing every host call it makes,
+    /// and return the turn's result value. Reused by both the top-level run and
+    /// each scheduled-callback invocation (so callbacks may themselves make
+    /// `dart:*` calls and schedule further work).
+    fn drive(&mut self, mut res: VmExecResult) -> Value {
         loop {
             if !res.has_host_call {
-                return Ok(parse_or_null(&res.result_value));
+                return parse_or_null(&res.result_value);
             }
             let reply = self.service(&res.host_call_data);
             res = api::continue_execution(self.machine_id.clone(), reply.to_string());
         }
+    }
+
+    /// Drain the event loop: run every due microtask/timer callback (which may
+    /// enqueue more) until quiescent, respecting Dart's ordering. Each callback
+    /// re-enters the guest via [`DISPATCH_FN`].
+    fn pump(&mut self) -> Result<(), DartError> {
+        let mut ran: u64 = 0;
+        while let Some(task) = self.events.next_task() {
+            ran += 1;
+            if ran > self.max_pump_tasks {
+                return Err(DartError::PumpBudgetExceeded);
+            }
+            // args = [cbId, value]; timer/microtask callbacks take no value.
+            let input = json!([task.cb, Value::Null]).to_string();
+            let res = api::execute_vm_func_with_input(
+                self.machine_id.clone(),
+                DISPATCH_FN.to_string(),
+                input,
+                task.cb as i64,
+            );
+            let _ = self.drive(res);
+        }
+        Ok(())
     }
 
     /// Service one `{machineId, apiName, payload}` envelope, returning the JSON
@@ -169,12 +221,47 @@ impl DartRuntime {
             "typed_data" => self.typed_data.dispatch(method, args),
             "ui" => self.ui.dispatch(method, args),
             "core" | "math" => self.core.dispatch(library, method, args),
+            "async" => self.dispatch_async(method, args),
             other => Err(format!("unimplemented library dart:{other} (method {method})")),
         };
 
         match result {
             Ok(v) => v,
             Err(msg) => dart_error(&msg),
+        }
+    }
+
+    /// `dart:async` native scheduling hooks. `Future`/`Stream`/`Completer` and
+    /// `async`/`await` sit on top of these in Dart source.
+    fn dispatch_async(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            // scheduleMicrotask(cbId)
+            "scheduleMicrotask" => {
+                let cb = args
+                    .first()
+                    .and_then(|v| v.as_u64())
+                    .ok_or("scheduleMicrotask requires a callback id")?;
+                self.events.schedule_microtask(cb);
+                Ok(Value::Null)
+            }
+            // Timer(cbId, delayMs) -> timerId
+            "Timer" => {
+                let cb = args
+                    .first()
+                    .and_then(|v| v.as_u64())
+                    .ok_or("Timer requires a callback id")?;
+                let delay = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0);
+                Ok(serde_json::json!(self.events.schedule_timer(cb, delay)))
+            }
+            // Timer.cancel(timerId) -> bool
+            "Timer.cancel" => {
+                let id = args
+                    .first()
+                    .and_then(|v| v.as_u64())
+                    .ok_or("Timer.cancel requires a timer id")?;
+                Ok(serde_json::json!(self.events.cancel_timer(id)))
+            }
+            other => Err(format!("NoSuchMethodError: dart:async/{other}")),
         }
     }
 }

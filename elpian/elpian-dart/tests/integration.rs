@@ -75,6 +75,41 @@ fn guest_uses_core_and_math() {
     assert_eq!(rt.emitted()[1], serde_json::json!(1_700_000_000_000i64));
 }
 
+/// The async event loop drives real guest callbacks in Dart's exact order:
+/// microtasks before timers, with nested scheduling handled correctly. The guest
+/// routes scheduled callbacks through `__dartDispatch`, exactly as generated Dart
+/// glue would.
+#[test]
+fn event_loop_runs_callbacks_in_dart_order() {
+    let code = r#"
+        function __dartDispatch(a) {
+            var id = a[0];
+            askHost("test.emit", ["cb" + id]);
+            // callback 3 (a microtask) schedules a further microtask, cb 4,
+            // which must still run before the already-scheduled timer cb 2.
+            if (id == 3) { askHost("dart:async/scheduleMicrotask", [4]); }
+        }
+        askHost("dart:async/scheduleMicrotask", [1]);
+        askHost("dart:async/Timer", [2, 10]);
+        askHost("dart:async/scheduleMicrotask", [3]);
+    "#;
+    let mut rt = DartRuntime::from_js(
+        "async_test",
+        code,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    let order: Vec<String> = rt
+        .emitted()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    // 1 and 3 (microtasks) first; 3 schedules 4 which still precedes the timer 2.
+    assert_eq!(order, vec!["cb1", "cb3", "cb4", "cb2"]);
+}
+
 /// Governance: with the `Painting` capability revoked, a `dart:ui` call is
 /// denied by the governor and the guest receives a thrown-error envelope rather
 /// than reaching the library.
