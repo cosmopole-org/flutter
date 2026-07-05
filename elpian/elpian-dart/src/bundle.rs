@@ -7,7 +7,7 @@
 //! pluggable via [`SignatureScheme`]; the default is HMAC-SHA256 over the bytes,
 //! and a production deployment can drop in ed25519 without touching the flow.
 
-use crate::sha256::{constant_time_eq, hmac_sha256};
+use crate::sha256::{constant_time_eq, hex, hmac_sha256, sha256};
 
 /// A delivered code bundle. `source` is Dart (or the interim JS) for the
 /// front-end; `signature` authenticates `source` + metadata.
@@ -112,6 +112,99 @@ impl<S: SignatureScheme> BundleLoader<S> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Signed manifest: dependency resolution + content-hash pinning
+// ---------------------------------------------------------------------------
+
+/// One pinned bundle in a manifest: its id, version, and the SHA-256 of its
+/// source (content addressing / integrity pin).
+#[derive(Debug, Clone)]
+pub struct ManifestEntry {
+    pub id: String,
+    pub version: u64,
+    pub sha256_hex: String,
+}
+
+/// A signed manifest listing an app and its dependency bundles. Signing the
+/// manifest (which pins each bundle's content hash) means individual bundles do
+/// not each need a signature — the manifest vouches for their exact bytes.
+#[derive(Debug, Clone, Default)]
+pub struct Manifest {
+    pub entries: Vec<ManifestEntry>,
+    pub signature: Vec<u8>,
+}
+
+impl Manifest {
+    pub fn signing_input(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for e in &self.entries {
+            for field in [&e.id, &e.version.to_string(), &e.sha256_hex] {
+                buf.extend_from_slice(&(field.len() as u64).to_be_bytes());
+                buf.extend_from_slice(field.as_bytes());
+            }
+        }
+        buf
+    }
+}
+
+/// Build a manifest entry for a bundle, pinning its content hash.
+pub fn pin(bundle: &CodeBundle) -> ManifestEntry {
+    ManifestEntry {
+        id: bundle.id.clone(),
+        version: bundle.version,
+        sha256_hex: hex(&sha256(bundle.source.as_bytes())),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ManifestError {
+    BadSignature,
+    MissingBundle(String),
+    HashMismatch(String),
+}
+
+/// Verifies a signed manifest, then resolves each entry against the supplied
+/// bundles, checking every bundle's content hash against its pin before trusting
+/// its source.
+pub struct ManifestLoader<S: SignatureScheme> {
+    scheme: S,
+}
+
+impl<S: SignatureScheme> ManifestLoader<S> {
+    pub fn new(scheme: S) -> Self {
+        ManifestLoader { scheme }
+    }
+
+    pub fn sign(&self, manifest: &mut Manifest) {
+        manifest.signature = self.scheme.sign(&manifest.signing_input());
+    }
+
+    /// Verify the manifest and resolve its entries to trusted sources, in
+    /// manifest order. Any missing bundle or content-hash mismatch fails closed.
+    pub fn resolve(
+        &self,
+        manifest: &Manifest,
+        bundles: &[CodeBundle],
+    ) -> Result<Vec<String>, ManifestError> {
+        if !self.scheme.verify(&manifest.signing_input(), &manifest.signature) {
+            return Err(ManifestError::BadSignature);
+        }
+        let mut sources = Vec::new();
+        for entry in &manifest.entries {
+            let bundle = bundles
+                .iter()
+                .find(|b| b.id == entry.id)
+                .ok_or_else(|| ManifestError::MissingBundle(entry.id.clone()))?;
+            let actual = hex(&sha256(bundle.source.as_bytes()));
+            if actual != entry.sha256_hex {
+                return Err(ManifestError::HashMismatch(entry.id.clone()));
+            }
+            sources.push(bundle.source.clone());
+        }
+        Ok(sources)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +264,30 @@ mod tests {
         assert_eq!(
             loader.accept(&v1),
             Err(BundleError::Downgrade { installed: 2, offered: 1 })
+        );
+    }
+
+    #[test]
+    fn signed_manifest_resolves_dependencies_and_pins_content() {
+        let key = *b"manifest-key";
+        let signer = ManifestLoader::new(HmacSha256Scheme::new(key));
+
+        let app = CodeBundle { id: "app".into(), version: 3, entrypoint: "main".into(), source: "void main(){}".into(), signature: vec![] };
+        let dep = CodeBundle { id: "widgets".into(), version: 3, entrypoint: "".into(), source: "class W {}".into(), signature: vec![] };
+
+        let mut manifest = Manifest { entries: vec![pin(&app), pin(&dep)], signature: vec![] };
+        signer.sign(&mut manifest);
+
+        let loader = ManifestLoader::new(HmacSha256Scheme::new(key));
+        let sources = loader.resolve(&manifest, &[dep.clone(), app.clone()]).expect("resolves");
+        assert_eq!(sources, vec!["void main(){}".to_string(), "class W {}".to_string()]);
+
+        // A bundle whose content doesn't match its pin is rejected.
+        let mut evil = app.clone();
+        evil.source = "void main(){ steal(); }".into();
+        assert_eq!(
+            loader.resolve(&manifest, &[dep, evil]),
+            Err(ManifestError::HashMismatch("app".into()))
         );
     }
 }

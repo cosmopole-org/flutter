@@ -419,3 +419,36 @@ fn reified_is_and_as_from_dart() {
         ]
     );
 }
+
+/// Deepen P5: retained scene diffing — two frames that differ only in one rect's
+/// color yield a minimal patch, not a whole new tree.
+#[test]
+fn frame_diff_is_minimal() {
+    let dart = r#"
+        var color = 100;
+        void onPointerEvent(e) { color = 200; }
+        void onDrawFrame() {
+            askHost("dart:ui/PictureRecorder.beginRecording", []);
+            askHost("dart:ui/Canvas.drawRect", [0.0, 0.0, 10.0, 10.0, color]);
+            var pic = askHost("dart:ui/PictureRecorder.endRecording", []);
+            var scene = askHost("dart:ui/Picture.toScene", [pic]);
+            askHost("dart:ui/FlutterView.render", [scene]);
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "diff_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("defines handlers");
+
+    let p0 = rt.render_frame_patch(16_000);
+    assert_eq!(p0.len(), 1); // first frame: full set
+
+    rt.dispatch_pointer(PointerEvent { pointer: 1, phase: PointerPhase::Down, x: 1.0, y: 1.0 });
+    let p1 = rt.render_frame_patch(32_000);
+    assert_eq!(p1.len(), 1, "only the color should differ");
+    assert_eq!(p1[0].value, Some(serde_json::json!(200)));
+}

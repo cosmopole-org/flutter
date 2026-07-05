@@ -63,6 +63,8 @@ pub struct DartRuntime {
     max_pump_tasks: u64,
     /// The scene the guest submitted via `FlutterView.render` this frame.
     current_frame: Option<Value>,
+    /// The last fully-rendered frame, retained for diffing.
+    last_frame: Option<Value>,
     /// Class hierarchy for reified `is`/`as` checks over instances.
     class_table: crate::types::ClassTable,
     emitted: Vec<Value>,
@@ -96,6 +98,7 @@ impl DartRuntime {
             ports: crate::isolate::PortTable::new(),
             max_pump_tasks: DEFAULT_MAX_PUMP_TASKS,
             current_frame: None,
+            last_frame: None,
             class_table: crate::types::ClassTable::new(),
             emitted: Vec::new(),
             log: Vec::new(),
@@ -260,6 +263,19 @@ impl DartRuntime {
         self.invoke_handler(handlers::BEGIN_FRAME, json!(frame_time_micros));
         self.invoke_handler(handlers::DRAW_FRAME, Value::Null);
         self.current_frame.take()
+    }
+
+    /// Produce one frame and return only the **minimal patch** versus the last
+    /// frame (retained diffing), so the host transmits/repaints only what
+    /// changed. The first frame returns a single full-set patch.
+    pub fn render_frame_patch(&mut self, frame_time_micros: i64) -> Vec<crate::scene_diff::Patch> {
+        let new = self.render_frame(frame_time_micros).unwrap_or(Value::Null);
+        let patches = match &self.last_frame {
+            Some(old) => crate::scene_diff::diff(old, &new),
+            None => vec![crate::scene_diff::Patch { path: vec![], value: Some(new.clone()) }],
+        };
+        self.last_frame = Some(new);
+        patches
     }
 
     /// Service one `{machineId, apiName, payload}` envelope, returning the JSON

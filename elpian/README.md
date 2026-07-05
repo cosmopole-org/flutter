@@ -69,19 +69,25 @@ Every `dart:*` call passes through both:
 | Dart **numeric tower** (`int` vs `double`, `~/`, `/`→double, wrapping, `is int`) | ✅ built, tested | `value.rs` |
 | **P1** `dart:typed_data` — `ByteData` + typed-list views + endianness + `setRange` | ✅ built, tested | `typed_data.rs` |
 | **P1** `dart:ui` — `Canvas`/`Paint`/`Path`/transform/clip/`PictureRecorder`/`SceneBuilder` → scene tree | ✅ built, tested | `dart_ui.rs` |
-| **P1** `dart:core`/`dart:math` — `DateTime.now`, seeded `Random`, num/string formatting, math fns | ✅ built, tested | `core.rs` |
-| **P2** async model — microtask/timer event loop with Dart's exact ordering | ✅ built, tested | `async_loop.rs`, `runtime.rs` |
-| **P3** Dart → Elpian front-end (bounded subset: types, `for`/`while`/`if`, `~/`, interpolation) | ✅ built, tested | `dart_frontend.rs` |
-| **P4** reified types, subtyping, `is`/`as`, `const` canonicalization, `noSuchMethod` | ✅ built, tested | `types.rs` |
+| **P1** `dart:core`/`dart:math` — `DateTime.now`, seeded `Random`, math fns, String methods | ✅ built, tested | `core.rs` |
+| **P1+** `dart:convert` — JSON / UTF-8 / Base64 codecs | ✅ built, tested | `convert.rs` |
+| **P2** async model — microtask/timer event loop with Dart's exact ordering + `Timer.periodic` | ✅ built, tested | `async_loop.rs`, `runtime.rs` |
+| **P2+** `dart:isolate` — `ReceivePort`/`SendPort`/`Isolate.spawn` (cooperative) | ✅ built, tested | `isolate.rs` |
+| **P3** Dart → Elpian front-end — types, control flow, `~/`, interpolation, ternary, `++`/compound | ✅ built, tested | `dart_frontend.rs` |
+| **P3+** Dart **classes** — fields, ctors (`this.x`), methods, `extends`/`super`, `this`, instantiation | ✅ built, tested | `dart_frontend.rs` |
+| **P4** reified types, subtyping, function types, generics substitution, `const` canon., `noSuchMethod` | ✅ built, tested | `types.rs` |
+| **P4+** reified `is`/`as` end-to-end — class-instance subtype + primitive checks from Dart | ✅ built, tested | `runtime.rs` |
 | **P5** framework binding — pointer/lifecycle/text events + vsync frame pump | ✅ built, tested | `binding.rs`, `runtime.rs` |
-| **P5** signed code-delivery — SHA-256/HMAC (KAT-verified) + verify-before-load + downgrade guard | ✅ built, tested | `sha256.rs`, `bundle.rs` |
+| **P5+** retained **scene diffing** — minimal per-frame patch (diff + apply) | ✅ built, tested | `scene_diff.rs` |
+| **P5** signed code-delivery — SHA-256/HMAC (KAT-verified), verify-before-load, downgrade guard, signed **manifest** with content-hash pinning | ✅ built, tested | `sha256.rs`, `bundle.rs` |
 | native + `wasm32` compilation | ✅ verified | — |
 
-**55 tests pass** (native) and the whole stack builds for `wasm32`. The
+**79 tests pass** (native) and the whole stack builds for `wasm32`. The
 integration tests run **real guest programs on the real VM** end-to-end,
-including: a Dart-source program (front-end → VM), the async ordering guarantee,
-a capability denial, a resource-limit cutoff, the pointer-event + frame-render
-loop, and the signed-bundle accept/tamper-reject path.
+including: Dart classes with inheritance, reified `is`/`as`, the async ordering
+guarantee, isolate message passing, a capability denial, a resource-limit
+cutoff, the pointer-event + frame-render loop with retained diffing, and the
+signed-bundle accept/tamper-reject path.
 
 > A finding that de-risks the language work: Elpian's value model **already
 > represents integers and floats with separate tags** (`typ` 1/2/3 = i16/i32/i64,

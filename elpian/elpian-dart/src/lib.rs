@@ -49,6 +49,7 @@ pub mod dart_ui;
 pub mod governance;
 pub mod isolate;
 pub mod sha256;
+pub mod scene_diff;
 pub mod runtime;
 pub mod typed_data;
 pub mod types;
