@@ -322,3 +322,62 @@ fn periodic_timer_end_to_end() {
     let out: Vec<String> = rt.emitted().iter().map(|v| v.as_str().unwrap().to_string()).collect();
     assert_eq!(out, vec!["tick1", "tick2", "tick3"]);
 }
+
+/// Deepen P3: a real Dart **class** — fields, initializing-formal constructor,
+/// methods with bare field references, instantiation, and method calls — compiled
+/// to a native JS class and run on the VM.
+#[test]
+fn runs_a_dart_class() {
+    let dart = r#"
+        class Counter {
+            int value = 0;
+            Counter(this.value);
+            void inc() { value = value + 1; }
+            int read() { return value; }
+        }
+        void main() {
+            Counter c = Counter(10);
+            c.inc();
+            c.inc();
+            askHost("test.emit", [c.read()]);
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "class_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("dart class compiles");
+    rt.run().expect("runs");
+    assert_eq!(rt.emitted(), &[serde_json::json!(12)]);
+}
+
+/// Deepen P3: inheritance with `super()` and an overriding subclass, plus a
+/// ternary and compound assignment, end-to-end.
+#[test]
+fn runs_dart_inheritance() {
+    let dart = r#"
+        class Animal {
+            int legs = 4;
+            int legCount() { return legs; }
+        }
+        class Bird extends Animal {
+            Bird() { legs = 2; }
+        }
+        void main() {
+            Bird b = Bird();
+            int n = b.legCount();
+            askHost("test.emit", [n > 2 ? "many" : "few"]);
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "inherit_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    assert_eq!(rt.emitted(), &[serde_json::json!("few")]);
+}

@@ -11,15 +11,22 @@
 //! Supported subset (grows over the roadmap):
 //! * top-level function declarations and statements; typed or `var`/`final`
 //!   locals (types are parsed and erased);
+//! * **classes**: fields (with initializers), constructors incl. `this.x`
+//!   initializing formals, methods, `extends`/`super`, instantiation
+//!   (`ClassName(args)`), member access, and `this`. Bare field/method
+//!   references inside methods resolve to `this.member` (including inherited
+//!   members), so idiomatic Dart lowers to valid JS classes;
 //! * `if`/`else`, `while`, C-style `for` (lowered to `while`), `return`, blocks;
 //! * expressions: literals, identifiers, calls, list literals, indexing,
-//!   assignment, `|| && == != < <= > >= + - * / % ~/`, unary `! -`;
+//!   assignment + compound assignment (`+= -= *= /=`), `++`/`--`, ternary
+//!   `?:`, `|| && == != < <= > >= + - * / % ~/`, unary `! -`;
 //! * string interpolation (`"$x"`, `"${expr}"`) lowered to concatenation;
 //! * `print(x)` lowered to `askHost("log",[x])`; `~/` lowered to a trunc-div
 //!   helper. `main()` is auto-invoked if present.
 //!
-//! NOT yet covered (later phases): classes/mixins, generics, pattern matching,
-//! `async`/`await` sugar (the runtime primitives exist; the sugar is Phase 4+).
+//! NOT yet covered (later phases): mixins, generics, named args, pattern
+//! matching, initializer lists with super-args, `async`/`await` sugar (the
+//! runtime primitives exist; the sugar is a later step).
 
 // ---------------------------------------------------------------------------
 // Tokens
@@ -42,6 +49,9 @@ enum Tok {
     RBracket,
     Comma,
     Semi,
+    Dot,
+    Question,
+    Colon,
     Op(String),
     Kw(String),
     Eof,
@@ -56,7 +66,7 @@ enum StrPart {
 
 const KEYWORDS: &[&str] = &[
     "var", "final", "if", "else", "while", "for", "return", "void", "int", "double", "num",
-    "String", "bool", "dynamic",
+    "String", "bool", "dynamic", "class", "extends", "this", "new", "super",
 ];
 
 // ---------------------------------------------------------------------------
@@ -255,11 +265,42 @@ impl<'a> Lexer<'a> {
             b']' => Tok::RBracket,
             b',' => Tok::Comma,
             b';' => Tok::Semi,
-            b'+' => Tok::Op("+".into()),
-            b'-' => Tok::Op("-".into()),
-            b'*' => Tok::Op("*".into()),
+            b'.' => Tok::Dot,
+            b'?' => Tok::Question,
+            b':' => Tok::Colon,
+            b'+' => {
+                if two(b'+', b'+', self) {
+                    Tok::Op("++".into())
+                } else if two(b'+', b'=', self) {
+                    Tok::Op("+=".into())
+                } else {
+                    Tok::Op("+".into())
+                }
+            }
+            b'-' => {
+                if two(b'-', b'-', self) {
+                    Tok::Op("--".into())
+                } else if two(b'-', b'=', self) {
+                    Tok::Op("-=".into())
+                } else {
+                    Tok::Op("-".into())
+                }
+            }
+            b'*' => {
+                if two(b'*', b'=', self) {
+                    Tok::Op("*=".into())
+                } else {
+                    Tok::Op("*".into())
+                }
+            }
             b'%' => Tok::Op("%".into()),
-            b'/' => Tok::Op("/".into()),
+            b'/' => {
+                if two(b'/', b'=', self) {
+                    Tok::Op("/=".into())
+                } else {
+                    Tok::Op("/".into())
+                }
+            }
             b'~' => {
                 if two(b'~', b'/', self) {
                     Tok::Op("~/".into())
@@ -331,8 +372,19 @@ enum Expr {
     Unary(String, Box<Expr>),
     Binary(String, Box<Expr>, Box<Expr>),
     Assign(Box<Expr>, Box<Expr>),
+    /// Compound assignment `lhs op= rhs` (`+= -= *= /=`).
+    AssignOp(String, Box<Expr>, Box<Expr>),
+    /// `++`/`--`; the bool is true for prefix form.
+    Update(String, Box<Expr>, bool),
+    Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     Index(Box<Expr>, Box<Expr>),
+    /// Member access `obj.name`.
+    Member(Box<Expr>, String),
+    /// `this`.
+    This,
+    /// Instantiation `ClassName(args)` — Dart has no `new` keyword required.
+    New(String, Vec<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -346,8 +398,35 @@ enum Stmt {
 }
 
 #[derive(Debug, Clone)]
+struct CtorParam {
+    name: String,
+    /// `this.x` shorthand — assigns the field directly.
+    is_this: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Method {
+    name: String,
+    params: Vec<String>,
+    body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone)]
+struct ClassDecl {
+    name: String,
+    superclass: Option<String>,
+    fields: Vec<(String, Option<Expr>)>,
+    ctor_params: Vec<CtorParam>,
+    ctor_body: Vec<Stmt>,
+    has_ctor: bool,
+    calls_super: bool,
+    methods: Vec<Method>,
+}
+
+#[derive(Debug, Clone)]
 enum Item {
     Func(String, Vec<String>, Vec<Stmt>),
+    Class(ClassDecl),
     Stmt(Stmt),
 }
 
@@ -358,11 +437,22 @@ enum Item {
 struct Parser {
     toks: Vec<Tok>,
     i: usize,
+    class_names: std::collections::HashSet<String>,
 }
 
 impl Parser {
     fn new(toks: Vec<Tok>) -> Self {
-        Parser { toks, i: 0 }
+        // Pre-scan for class names so `ClassName(args)` instantiations resolve
+        // even when the class is declared later in the file.
+        let mut class_names = std::collections::HashSet::new();
+        for w in toks.windows(2) {
+            if w[0] == Tok::Kw("class".into()) {
+                if let Tok::Ident(n) = &w[1] {
+                    class_names.insert(n.clone());
+                }
+            }
+        }
+        Parser { toks, i: 0, class_names }
     }
 
     fn peek(&self) -> &Tok {
@@ -399,10 +489,122 @@ impl Parser {
     /// A top-level item is a function declaration or a statement. Function form:
     /// `[type] name ( params ) { body }` — detected by lookahead for `(...) {`.
     fn parse_item(&mut self) -> Result<Item, String> {
+        if *self.peek() == Tok::Kw("class".into()) {
+            return Ok(Item::Class(self.parse_class()?));
+        }
         if self.looks_like_function() {
             return self.parse_function();
         }
         Ok(Item::Stmt(self.parse_stmt()?))
+    }
+
+    fn parse_class(&mut self) -> Result<ClassDecl, String> {
+        self.bump(); // 'class'
+        let name = self.ident()?;
+        let superclass = if *self.peek() == Tok::Kw("extends".into()) {
+            self.bump();
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        self.eat(&Tok::LBrace)?;
+        let mut fields = Vec::new();
+        let mut methods = Vec::new();
+        let mut ctor_params = Vec::new();
+        let mut ctor_body = Vec::new();
+        let mut has_ctor = false;
+
+        while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+            // Optional leading type (primitive kw, or `Type name` where Type is
+            // an identifier followed by another identifier).
+            if self.is_type_kw()
+                || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Ident(_)))
+                || *self.peek() == Tok::Kw("var".into())
+                || *self.peek() == Tok::Kw("final".into())
+            {
+                self.bump(); // erase the type / var / final
+            }
+            let member_name = self.ident()?;
+            if *self.peek() == Tok::LParen {
+                // constructor or method
+                if member_name == name {
+                    has_ctor = true;
+                    ctor_params = self.parse_ctor_params()?;
+                    // A constructor body may be a block or just `;` (common with
+                    // initializing formals: `Counter(this.value);`).
+                    ctor_body = if *self.peek() == Tok::Semi {
+                        self.bump();
+                        Vec::new()
+                    } else {
+                        self.parse_block()?
+                    };
+                } else {
+                    self.eat(&Tok::LParen)?;
+                    let mut params = Vec::new();
+                    while *self.peek() != Tok::RParen {
+                        if self.is_type_kw()
+                            || (matches!(self.peek(), Tok::Ident(_))
+                                && matches!(self.peek_at(1), Tok::Ident(_)))
+                        {
+                            self.bump();
+                        }
+                        params.push(self.ident()?);
+                        if *self.peek() == Tok::Comma {
+                            self.bump();
+                        }
+                    }
+                    self.eat(&Tok::RParen)?;
+                    let body = self.parse_block()?;
+                    methods.push(Method { name: member_name, params, body });
+                }
+            } else {
+                // field: optional initializer, then ';'
+                let init = if *self.peek() == Tok::Op("=".into()) {
+                    self.bump();
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                self.eat(&Tok::Semi)?;
+                fields.push((member_name, init));
+            }
+        }
+        self.eat(&Tok::RBrace)?;
+        let calls_super = superclass.is_some();
+        Ok(ClassDecl {
+            name,
+            superclass,
+            fields,
+            ctor_params,
+            ctor_body,
+            has_ctor,
+            calls_super,
+            methods,
+        })
+    }
+
+    fn parse_ctor_params(&mut self) -> Result<Vec<CtorParam>, String> {
+        self.eat(&Tok::LParen)?;
+        let mut params = Vec::new();
+        while *self.peek() != Tok::RParen {
+            if *self.peek() == Tok::Kw("this".into()) {
+                self.bump();
+                self.eat(&Tok::Dot)?;
+                params.push(CtorParam { name: self.ident()?, is_this: true });
+            } else {
+                if self.is_type_kw()
+                    || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Ident(_)))
+                {
+                    self.bump();
+                }
+                params.push(CtorParam { name: self.ident()?, is_this: false });
+            }
+            if *self.peek() == Tok::Comma {
+                self.bump();
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        Ok(params)
     }
 
     fn looks_like_function(&self) -> bool {
@@ -503,6 +705,11 @@ impl Parser {
                     Ok(Stmt::Return(Some(e)))
                 }
             }
+            // Class-typed local declaration: `Type name [= expr];`.
+            Tok::Ident(_) if matches!(self.peek_at(1), Tok::Ident(_)) => {
+                self.bump(); // erase the type
+                self.parse_var_tail()
+            }
             _ => {
                 let e = self.parse_expr()?;
                 self.eat(&Tok::Semi)?;
@@ -597,13 +804,33 @@ impl Parser {
     }
 
     fn parse_assign(&mut self) -> Result<Expr, String> {
-        let lhs = self.parse_binary(0)?;
+        let lhs = self.parse_ternary()?;
         if *self.peek() == Tok::Op("=".into()) {
             self.bump();
             let rhs = self.parse_assign()?;
             return Ok(Expr::Assign(Box::new(lhs), Box::new(rhs)));
         }
+        if let Tok::Op(o) = self.peek() {
+            if matches!(o.as_str(), "+=" | "-=" | "*=" | "/=") {
+                let op = o.clone();
+                self.bump();
+                let rhs = self.parse_assign()?;
+                return Ok(Expr::AssignOp(op, Box::new(lhs), Box::new(rhs)));
+            }
+        }
         Ok(lhs)
+    }
+
+    fn parse_ternary(&mut self) -> Result<Expr, String> {
+        let cond = self.parse_binary(0)?;
+        if *self.peek() == Tok::Question {
+            self.bump();
+            let then = self.parse_assign()?;
+            self.eat(&Tok::Colon)?;
+            let els = self.parse_assign()?;
+            return Ok(Expr::Ternary(Box::new(cond), Box::new(then), Box::new(els)));
+        }
+        Ok(cond)
     }
 
     fn parse_binary(&mut self, min_bp: u8) -> Result<Expr, String> {
@@ -634,6 +861,12 @@ impl Parser {
                 let e = self.parse_unary()?;
                 return Ok(Expr::Unary(op, Box::new(e)));
             }
+            if o == "++" || o == "--" {
+                let op = o.clone();
+                self.bump();
+                let e = self.parse_unary()?;
+                return Ok(Expr::Update(op, Box::new(e), true));
+            }
         }
         self.parse_postfix()
     }
@@ -652,13 +885,30 @@ impl Parser {
                         }
                     }
                     self.eat(&Tok::RParen)?;
-                    e = Expr::Call(Box::new(e), args);
+                    // `ClassName(args)` (no member/index in front) is a Dart
+                    // instantiation, not a plain call.
+                    e = match e {
+                        Expr::Ident(name) if self.class_names.contains(&name) => {
+                            Expr::New(name, args)
+                        }
+                        callee => Expr::Call(Box::new(callee), args),
+                    };
                 }
                 Tok::LBracket => {
                     self.bump();
                     let idx = self.parse_expr()?;
                     self.eat(&Tok::RBracket)?;
                     e = Expr::Index(Box::new(e), Box::new(idx));
+                }
+                Tok::Dot => {
+                    self.bump();
+                    let name = self.ident()?;
+                    e = Expr::Member(Box::new(e), name);
+                }
+                Tok::Op(o) if o == "++" || o == "--" => {
+                    let op = o.clone();
+                    self.bump();
+                    e = Expr::Update(op, Box::new(e), false);
                 }
                 _ => break,
             }
@@ -673,6 +923,21 @@ impl Parser {
             Tok::Str(p) => Ok(Expr::Str(p)),
             Tok::Bool(b) => Ok(Expr::Bool(b)),
             Tok::Null => Ok(Expr::Null),
+            Tok::Kw(k) if k == "this" => Ok(Expr::This),
+            Tok::Kw(k) if k == "new" => {
+                // Optional `new` keyword: `new ClassName(args)`.
+                let name = self.ident()?;
+                self.eat(&Tok::LParen)?;
+                let mut args = Vec::new();
+                while *self.peek() != Tok::RParen {
+                    args.push(self.parse_expr()?);
+                    if *self.peek() == Tok::Comma {
+                        self.bump();
+                    }
+                }
+                self.eat(&Tok::RParen)?;
+                Ok(Expr::New(name, args))
+            }
             Tok::Ident(s) => Ok(Expr::Ident(s)),
             Tok::LParen => {
                 let e = self.parse_expr()?;
@@ -716,154 +981,388 @@ const PRELUDE: &str = "function __truncDiv(a, b){ return (a - (a % b)) / b; }\n"
 /// Transpile Dart-subset source to the JS subset the Elpian VM ingests.
 pub fn transpile(dart: &str) -> Result<String, String> {
     let toks = Lexer::new(dart).tokenize()?;
+    let class_names = {
+        let mut set = std::collections::HashSet::new();
+        for w in toks.windows(2) {
+            if w[0] == Tok::Kw("class".into()) {
+                if let Tok::Ident(n) = &w[1] {
+                    set.insert(n.clone());
+                }
+            }
+        }
+        set
+    };
     let items = Parser::new(toks).parse_program()?;
-    let mut out = String::from(PRELUDE);
-    let mut has_main = false;
-    for item in &items {
-        match item {
-            Item::Func(name, params, body) => {
-                if name == "main" {
-                    has_main = true;
+    let mut em = Emitter::new(class_names);
+    em.emit_program(&items);
+    Ok(em.out)
+}
+
+/// Scope-aware emitter. Inside a class body it resolves bare field references to
+/// `this.field` and bare method calls to `this.method(...)`, so idiomatic Dart
+/// (which omits `this.`) lowers to valid JS.
+type NameSet = std::collections::HashSet<String>;
+type NameMap = std::collections::HashMap<String, NameSet>;
+
+struct Emitter {
+    out: String,
+    class_names: NameSet,
+    /// Transitive (own + inherited) field names per class.
+    field_map: NameMap,
+    /// Transitive method names per class.
+    method_map: NameMap,
+    fields: NameSet,
+    methods: NameSet,
+    locals: Vec<NameSet>,
+    in_class: bool,
+}
+
+impl Emitter {
+    fn new(class_names: NameSet) -> Self {
+        Emitter {
+            out: String::from(PRELUDE),
+            class_names,
+            field_map: Default::default(),
+            method_map: Default::default(),
+            fields: Default::default(),
+            methods: Default::default(),
+            locals: Vec::new(),
+            in_class: false,
+        }
+    }
+
+    /// Build transitive field/method sets so inherited members inside a subclass
+    /// still resolve to `this.member`.
+    fn build_member_maps(&mut self, items: &[Item]) {
+        let mut own_fields: NameMap = Default::default();
+        let mut own_methods: NameMap = Default::default();
+        let mut supers: std::collections::HashMap<String, Option<String>> = Default::default();
+        for item in items {
+            if let Item::Class(c) = item {
+                own_fields.insert(c.name.clone(), c.fields.iter().map(|(n, _)| n.clone()).collect());
+                own_methods.insert(c.name.clone(), c.methods.iter().map(|m| m.name.clone()).collect());
+                // `this.x` params are also fields.
+                if let Some(set) = own_fields.get_mut(&c.name) {
+                    for p in &c.ctor_params {
+                        if p.is_this {
+                            set.insert(p.name.clone());
+                        }
+                    }
                 }
-                out.push_str(&format!("function {}({}) {{\n", name, params.join(", ")));
-                emit_stmts(body, &mut out, 1);
-                out.push_str("}\n");
-            }
-            Item::Stmt(s) => {
-                emit_stmt(s, &mut out, 0);
+                supers.insert(c.name.clone(), c.superclass.clone());
             }
         }
+        // Walk the superclass chain for each class.
+        for name in own_fields.keys().cloned().collect::<Vec<_>>() {
+            let mut fields = NameSet::new();
+            let mut methods = NameSet::new();
+            let mut cur = Some(name.clone());
+            let mut guard = 0;
+            while let Some(c) = cur {
+                if guard > 64 {
+                    break;
+                }
+                guard += 1;
+                if let Some(f) = own_fields.get(&c) {
+                    fields.extend(f.iter().cloned());
+                }
+                if let Some(m) = own_methods.get(&c) {
+                    methods.extend(m.iter().cloned());
+                }
+                cur = supers.get(&c).cloned().flatten();
+            }
+            self.field_map.insert(name.clone(), fields);
+            self.method_map.insert(name, methods);
+        }
     }
-    if has_main {
-        out.push_str("main();\n");
-    }
-    Ok(out)
-}
 
-fn indent(out: &mut String, n: usize) {
-    for _ in 0..n {
-        out.push_str("  ");
+    fn push_scope(&mut self) {
+        self.locals.push(Default::default());
     }
-}
-
-fn emit_stmts(stmts: &[Stmt], out: &mut String, depth: usize) {
-    for s in stmts {
-        emit_stmt(s, out, depth);
+    fn pop_scope(&mut self) {
+        self.locals.pop();
     }
-}
-
-fn emit_stmt(s: &Stmt, out: &mut String, depth: usize) {
-    indent(out, depth);
-    match s {
-        Stmt::Var(name, init) => {
-            match init {
-                Some(e) => out.push_str(&format!("var {} = {};\n", name, emit_expr(e))),
-                None => out.push_str(&format!("var {};\n", name)),
-            }
-        }
-        Stmt::Expr(e) => out.push_str(&format!("{};\n", emit_expr(e))),
-        Stmt::Return(e) => match e {
-            Some(e) => out.push_str(&format!("return {};\n", emit_expr(e))),
-            None => out.push_str("return;\n"),
-        },
-        Stmt::If(c, t, e) => {
-            out.push_str(&format!("if ({}) {{\n", emit_expr(c)));
-            emit_stmts(t, out, depth + 1);
-            indent(out, depth);
-            out.push('}');
-            if !e.is_empty() {
-                out.push_str(" else {\n");
-                emit_stmts(e, out, depth + 1);
-                indent(out, depth);
-                out.push('}');
-            }
-            out.push('\n');
-        }
-        Stmt::While(c, b) => {
-            out.push_str(&format!("while ({}) {{\n", emit_expr(c)));
-            emit_stmts(b, out, depth + 1);
-            indent(out, depth);
-            out.push_str("}\n");
-        }
-        Stmt::Block(b) => {
-            out.push_str("{\n");
-            emit_stmts(b, out, depth + 1);
-            indent(out, depth);
-            out.push_str("}\n");
+    fn declare(&mut self, name: &str) {
+        if let Some(top) = self.locals.last_mut() {
+            top.insert(name.to_string());
         }
     }
-}
+    fn is_local(&self, name: &str) -> bool {
+        self.locals.iter().any(|s| s.contains(name))
+    }
 
-fn emit_expr(e: &Expr) -> String {
-    match e {
-        Expr::Int(i) => i.to_string(),
-        Expr::Double(d) => {
-            // Ensure a decimal point survives so it stays a double.
-            if d.fract() == 0.0 {
-                format!("{d:.1}")
-            } else {
-                d.to_string()
+    fn indent(&mut self, n: usize) {
+        for _ in 0..n {
+            self.out.push_str("  ");
+        }
+    }
+
+    fn emit_program(&mut self, items: &[Item]) {
+        self.build_member_maps(items);
+        let mut has_main = false;
+        for item in items {
+            match item {
+                Item::Func(name, params, body) => {
+                    if name == "main" {
+                        has_main = true;
+                    }
+                    self.out.push_str(&format!("function {}({}) {{\n", name, params.join(", ")));
+                    self.push_scope();
+                    for p in params {
+                        self.declare(p);
+                    }
+                    self.emit_stmts(body, 1);
+                    self.pop_scope();
+                    self.out.push_str("}\n");
+                }
+                Item::Class(c) => self.emit_class(c),
+                Item::Stmt(s) => self.emit_stmt(s, 0),
             }
         }
-        Expr::Bool(b) => b.to_string(),
-        Expr::Null => "null".into(),
-        Expr::Ident(s) => s.clone(),
-        Expr::Str(parts) => emit_string(parts),
-        Expr::List(xs) => {
-            let inner: Vec<String> = xs.iter().map(emit_expr).collect();
-            format!("[{}]", inner.join(", "))
+        if has_main {
+            self.out.push_str("main();\n");
         }
-        Expr::Unary(op, x) => format!("({}{})", op, emit_expr(x)),
-        Expr::Binary(op, a, b) => {
-            if op == "~/" {
-                format!("__truncDiv({}, {})", emit_expr(a), emit_expr(b))
-            } else {
-                format!("({} {} {})", emit_expr(a), op, emit_expr(b))
+    }
+
+    fn emit_class(&mut self, c: &ClassDecl) {
+        self.in_class = true;
+        // Use transitive sets so inherited members resolve to `this.member`.
+        self.fields = self.field_map.get(&c.name).cloned().unwrap_or_default();
+        self.methods = self.method_map.get(&c.name).cloned().unwrap_or_default();
+
+        let ext = match &c.superclass {
+            Some(s) => format!(" extends {s}"),
+            None => String::new(),
+        };
+        self.out.push_str(&format!("class {}{} {{\n", c.name, ext));
+
+        let need_ctor = c.has_ctor
+            || c.calls_super
+            || !c.ctor_params.is_empty()
+            || c.fields.iter().any(|(_, init)| init.is_some());
+        if need_ctor {
+            let sig: Vec<String> = c.ctor_params.iter().map(|p| p.name.clone()).collect();
+            self.out.push_str(&format!("  constructor({}) {{\n", sig.join(", ")));
+            self.push_scope();
+            for p in &c.ctor_params {
+                self.declare(&p.name);
             }
-        }
-        Expr::Assign(a, b) => format!("{} = {}", emit_expr(a), emit_expr(b)),
-        Expr::Index(a, i) => format!("{}[{}]", emit_expr(a), emit_expr(i)),
-        Expr::Call(callee, args) => {
-            // Lower `print(x)` to the log host call.
-            if let Expr::Ident(name) = &**callee {
-                if name == "print" && args.len() == 1 {
-                    return format!("askHost(\"log\", [{}])", emit_expr(&args[0]));
+            if c.calls_super {
+                self.out.push_str("    super();\n");
+            }
+            // Field initializers run first; an initializing formal (`this.x`)
+            // then wins, matching Dart's initialization order.
+            for (fname, init) in &c.fields {
+                if let Some(e) = init {
+                    let v = self.emit_expr(e);
+                    self.out.push_str(&format!("    this.{fname} = {v};\n"));
                 }
             }
-            let a: Vec<String> = args.iter().map(emit_expr).collect();
-            format!("{}({})", emit_expr(callee), a.join(", "))
+            for p in &c.ctor_params {
+                if p.is_this {
+                    self.out.push_str(&format!("    this.{} = {};\n", p.name, p.name));
+                }
+            }
+            self.emit_stmts(&c.ctor_body, 2);
+            self.pop_scope();
+            self.out.push_str("  }\n");
         }
-    }
-}
 
-fn emit_string(parts: &[StrPart]) -> String {
-    if parts.len() == 1 {
-        if let StrPart::Lit(s) = &parts[0] {
-            return json_string(s);
+        for m in &c.methods {
+            self.out.push_str(&format!("  {}({}) {{\n", m.name, m.params.join(", ")));
+            self.push_scope();
+            for p in &m.params {
+                self.declare(p);
+            }
+            self.emit_stmts(&m.body, 2);
+            self.pop_scope();
+            self.out.push_str("  }\n");
+        }
+
+        self.out.push_str("}\n");
+        self.in_class = false;
+        self.fields.clear();
+        self.methods.clear();
+    }
+
+    fn emit_stmts(&mut self, stmts: &[Stmt], depth: usize) {
+        for s in stmts {
+            self.emit_stmt(s, depth);
         }
     }
-    let mut pieces = Vec::new();
-    // Start with an empty string so a leading expr coerces to string.
-    pieces.push("\"\"".to_string());
-    for p in parts {
-        match p {
-            StrPart::Lit(s) => pieces.push(json_string(s)),
-            StrPart::Expr(raw) => {
-                // Re-parse the interpolation expression and emit it.
-                let sub = transpile_expr(raw).unwrap_or_else(|_| "null".into());
-                pieces.push(format!("({})", sub));
+
+    fn emit_stmt(&mut self, s: &Stmt, depth: usize) {
+        self.indent(depth);
+        match s {
+            Stmt::Var(name, init) => {
+                match init {
+                    Some(e) => {
+                        let v = self.emit_expr(e);
+                        self.out.push_str(&format!("var {name} = {v};\n"));
+                    }
+                    None => self.out.push_str(&format!("var {name};\n")),
+                }
+                self.declare(name);
+            }
+            Stmt::Expr(e) => {
+                let v = self.emit_expr(e);
+                self.out.push_str(&format!("{v};\n"));
+            }
+            Stmt::Return(e) => match e {
+                Some(e) => {
+                    let v = self.emit_expr(e);
+                    self.out.push_str(&format!("return {v};\n"));
+                }
+                None => self.out.push_str("return;\n"),
+            },
+            Stmt::If(c, t, e) => {
+                let cond = self.emit_expr(c);
+                self.out.push_str(&format!("if ({cond}) {{\n"));
+                self.push_scope();
+                self.emit_stmts(t, depth + 1);
+                self.pop_scope();
+                self.indent(depth);
+                self.out.push('}');
+                if !e.is_empty() {
+                    self.out.push_str(" else {\n");
+                    self.push_scope();
+                    self.emit_stmts(e, depth + 1);
+                    self.pop_scope();
+                    self.indent(depth);
+                    self.out.push('}');
+                }
+                self.out.push('\n');
+            }
+            Stmt::While(c, b) => {
+                let cond = self.emit_expr(c);
+                self.out.push_str(&format!("while ({cond}) {{\n"));
+                self.push_scope();
+                self.emit_stmts(b, depth + 1);
+                self.pop_scope();
+                self.indent(depth);
+                self.out.push_str("}\n");
+            }
+            Stmt::Block(b) => {
+                self.out.push_str("{\n");
+                self.push_scope();
+                self.emit_stmts(b, depth + 1);
+                self.pop_scope();
+                self.indent(depth);
+                self.out.push_str("}\n");
             }
         }
     }
-    format!("({})", pieces.join(" + "))
-}
 
-/// Parse and emit a bare expression (used for `${...}` interpolation chunks).
-fn transpile_expr(src: &str) -> Result<String, String> {
-    let toks = Lexer::new(src).tokenize()?;
-    let mut p = Parser::new(toks);
-    let e = p.parse_expr()?;
-    Ok(emit_expr(&e))
+    fn resolve_ident(&self, name: &str) -> String {
+        if self.is_local(name) {
+            name.to_string()
+        } else if self.in_class && self.fields.contains(name) {
+            format!("this.{name}")
+        } else {
+            name.to_string()
+        }
+    }
+
+    fn emit_expr(&mut self, e: &Expr) -> String {
+        match e {
+            Expr::Int(i) => i.to_string(),
+            Expr::Double(d) => {
+                if d.fract() == 0.0 {
+                    format!("{d:.1}")
+                } else {
+                    d.to_string()
+                }
+            }
+            Expr::Bool(b) => b.to_string(),
+            Expr::Null => "null".into(),
+            Expr::This => "this".into(),
+            Expr::Ident(s) => self.resolve_ident(s),
+            Expr::Str(parts) => self.emit_string(parts),
+            Expr::List(xs) => {
+                let inner: Vec<String> = xs.iter().map(|x| self.emit_expr(x)).collect();
+                format!("[{}]", inner.join(", "))
+            }
+            Expr::Unary(op, x) => format!("({}{})", op, self.emit_expr(x)),
+            Expr::Update(op, x, prefix) => {
+                let v = self.emit_expr(x);
+                if *prefix {
+                    format!("({op}{v})")
+                } else {
+                    format!("({v}{op})")
+                }
+            }
+            Expr::Binary(op, a, b) => {
+                if op == "~/" {
+                    format!("__truncDiv({}, {})", self.emit_expr(a), self.emit_expr(b))
+                } else {
+                    format!("({} {} {})", self.emit_expr(a), op, self.emit_expr(b))
+                }
+            }
+            Expr::Ternary(c, t, e) => {
+                format!("({} ? {} : {})", self.emit_expr(c), self.emit_expr(t), self.emit_expr(e))
+            }
+            Expr::Assign(a, b) => format!("{} = {}", self.emit_expr(a), self.emit_expr(b)),
+            Expr::AssignOp(op, a, b) => {
+                format!("{} {} {}", self.emit_expr(a), op, self.emit_expr(b))
+            }
+            Expr::Index(a, i) => format!("{}[{}]", self.emit_expr(a), self.emit_expr(i)),
+            Expr::Member(obj, name) => format!("{}.{}", self.emit_expr(obj), name),
+            Expr::New(name, args) => {
+                let a: Vec<String> = args.iter().map(|x| self.emit_expr(x)).collect();
+                format!("new {}({})", name, a.join(", "))
+            }
+            Expr::Call(callee, args) => {
+                if let Expr::Ident(name) = &**callee {
+                    if name == "print" && args.len() == 1 {
+                        let a0 = self.emit_expr(&args[0]);
+                        return format!("askHost(\"log\", [{a0}])");
+                    }
+                    // Bare call to an own method inside a class -> this.method().
+                    if self.in_class && !self.is_local(name) && self.methods.contains(name) {
+                        let a: Vec<String> = args.iter().map(|x| self.emit_expr(x)).collect();
+                        return format!("this.{}({})", name, a.join(", "));
+                    }
+                }
+                let c = self.emit_expr(callee);
+                let a: Vec<String> = args.iter().map(|x| self.emit_expr(x)).collect();
+                format!("{}({})", c, a.join(", "))
+            }
+        }
+    }
+
+    fn emit_string(&mut self, parts: &[StrPart]) -> String {
+        if parts.len() == 1 {
+            if let StrPart::Lit(s) = &parts[0] {
+                return json_string(s);
+            }
+        }
+        let mut pieces = vec!["\"\"".to_string()];
+        for p in parts {
+            match p {
+                StrPart::Lit(s) => pieces.push(json_string(s)),
+                StrPart::Expr(raw) => {
+                    let sub = self.emit_interp(raw);
+                    pieces.push(format!("({sub})"));
+                }
+            }
+        }
+        format!("({})", pieces.join(" + "))
+    }
+
+    /// Parse and emit an interpolation chunk in the current scope, so field/
+    /// local resolution applies inside `${...}`.
+    fn emit_interp(&mut self, src: &str) -> String {
+        let toks = match Lexer::new(src).tokenize() {
+            Ok(t) => t,
+            Err(_) => return "null".into(),
+        };
+        let mut p = Parser::new(toks);
+        p.class_names = self.class_names.clone();
+        match p.parse_expr() {
+            Ok(e) => self.emit_expr(&e),
+            Err(_) => "null".into(),
+        }
+    }
 }
 
 fn json_string(s: &str) -> String {
@@ -899,5 +1398,39 @@ mod tests {
     fn parses_function_with_typed_params() {
         let js = transpile("int add(int a, int b) { return a + b; }").unwrap();
         assert!(js.contains("function add(a, b)"), "got: {js}");
+    }
+
+    #[test]
+    fn emits_native_class_with_field_resolution() {
+        let dart = r#"
+            class Counter {
+                int value = 0;
+                Counter(this.value);
+                void inc() { value = value + 1; }
+            }
+        "#;
+        let js = transpile(dart).unwrap();
+        assert!(js.contains("class Counter {"), "got: {js}");
+        assert!(js.contains("constructor(value)"), "got: {js}");
+        assert!(js.contains("this.value = value"), "got: {js}");
+        // Bare field ref inside a method resolves to this.value.
+        assert!(js.contains("this.value = (this.value + 1)"), "got: {js}");
+    }
+
+    #[test]
+    fn emits_inheritance_and_super() {
+        let dart = "class A { } class B extends A { int x = 1; }";
+        let js = transpile(dart).unwrap();
+        assert!(js.contains("class B extends A {"), "got: {js}");
+        assert!(js.contains("super();"), "got: {js}");
+    }
+
+    #[test]
+    fn instantiation_and_ternary_and_compound() {
+        let dart = "class P { } var p = P(); var y = 1 > 0 ? 2 : 3; var z = 5; z += 4;";
+        let js = transpile(dart).unwrap();
+        assert!(js.contains("new P()"), "got: {js}");
+        assert!(js.contains("? 2 : 3"), "got: {js}");
+        assert!(js.contains("z += 4"), "got: {js}");
     }
 }
