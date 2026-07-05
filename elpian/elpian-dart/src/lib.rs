@@ -46,6 +46,7 @@ pub mod dart_ui;
 pub mod governance;
 pub mod runtime;
 pub mod typed_data;
+pub mod types;
 pub mod value;
 
 pub use core::Clock;
