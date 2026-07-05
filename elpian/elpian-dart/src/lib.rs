@@ -41,6 +41,7 @@
 
 pub mod async_loop;
 pub mod core;
+pub mod dart_frontend;
 pub mod dart_ui;
 pub mod governance;
 pub mod runtime;

@@ -41,6 +41,8 @@ pub enum DartError {
     VmNotFound,
     /// The event-loop pump exceeded its per-run task budget (runaway guest).
     PumpBudgetExceeded,
+    /// The Dart front-end failed to compile the source (outside the subset).
+    Frontend(String),
 }
 
 /// A single embedded Dart runtime instance.
@@ -86,6 +88,19 @@ impl DartRuntime {
             log: Vec::new(),
             denied: Vec::new(),
         })
+    }
+
+    /// Build a runtime from **Dart-subset source**, compiled to the VM's input
+    /// by the Phase 3 front-end ([`crate::dart_frontend`]). Runtime intrinsics
+    /// are still reached via the `dart:*` host bridge.
+    pub fn from_dart(
+        machine_id: impl Into<String>,
+        dart_source: &str,
+        caps: DartCapabilitySet,
+        meter: ResourceMeter,
+    ) -> Result<Self, DartError> {
+        let js = crate::dart_frontend::transpile(dart_source).map_err(DartError::Frontend)?;
+        Self::from_js(machine_id, js, caps, meter)
     }
 
     /// Pin the clock (and thus `DateTime.now`) for reproducible runs/tests.

@@ -75,6 +75,37 @@ fn guest_uses_core_and_math() {
     assert_eq!(rt.emitted()[1], serde_json::json!(1_700_000_000_000i64));
 }
 
+/// Phase 3: real **Dart source** compiled by the front-end and executed on the
+/// VM end-to-end. Exercises typed locals, a C-style `for` (lowered to `while`),
+/// `~/`, a function call, string interpolation, and reaching the host bridge.
+#[test]
+fn runs_real_dart_source() {
+    let dart = r#"
+        int sumTo(int n) {
+            int total = 0;
+            for (int i = 1; i <= n; i = i + 1) {
+                total = total + i;
+            }
+            return total;
+        }
+        void main() {
+            int s = sumTo(10);
+            int half = s ~/ 2;
+            askHost("test.emit", ["sum=$s half=$half"]);
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "dart_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("dart compiles");
+    rt.run().expect("runs");
+    // 1+..+10 = 55; 55 ~/ 2 = 27.
+    assert_eq!(rt.emitted(), &[serde_json::json!("sum=55 half=27")]);
+}
+
 /// The async event loop drives real guest callbacks in Dart's exact order:
 /// microtasks before timers, with nested scheduling handled correctly. The guest
 /// routes scheduled callbacks through `__dartDispatch`, exactly as generated Dart
