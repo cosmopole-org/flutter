@@ -28,6 +28,10 @@ use crate::typed_data::TypedDataStore;
 /// continuations re-enter guest code.
 const DISPATCH_FN: &str = "__dartDispatch";
 
+/// Guest entrypoint invoked to deliver a `ReceivePort` message: the guest
+/// defines `function __portDispatch(args) { /* args = [portId, message] */ }`.
+const PORT_DISPATCH_FN: &str = "__portDispatch";
+
 /// Safety bound on a single `run()`'s event-loop pump, so a guest that endlessly
 /// reschedules microtasks cannot hang the host. Complements the VM instruction
 /// limit and the [`ResourceMeter`].
@@ -55,6 +59,7 @@ pub struct DartRuntime {
     ui: SceneRecorder,
     core: CoreRuntime,
     events: EventLoop,
+    ports: crate::isolate::PortTable,
     max_pump_tasks: u64,
     /// The scene the guest submitted via `FlutterView.render` this frame.
     current_frame: Option<Value>,
@@ -86,6 +91,7 @@ impl DartRuntime {
             ui: SceneRecorder::new(),
             core: CoreRuntime::new(Clock::System),
             events: EventLoop::new(),
+            ports: crate::isolate::PortTable::new(),
             max_pump_tasks: DEFAULT_MAX_PUMP_TASKS,
             current_frame: None,
             emitted: Vec::new(),
@@ -172,22 +178,38 @@ impl DartRuntime {
     /// re-enters the guest via [`DISPATCH_FN`].
     fn pump(&mut self) -> Result<(), DartError> {
         let mut ran: u64 = 0;
-        while let Some(task) = self.events.next_task() {
+        loop {
             ran += 1;
             if ran > self.max_pump_tasks {
                 return Err(DartError::PumpBudgetExceeded);
             }
-            // args = [cbId, value]; timer/microtask callbacks take no value.
-            let input = json!([task.cb, Value::Null]).to_string();
-            let res = api::execute_vm_func_with_input(
-                self.machine_id.clone(),
-                DISPATCH_FN.to_string(),
-                input,
-                task.cb as i64,
-            );
-            let _ = self.drive(res);
+            // Priority: microtasks/timers (event loop) first, then cooperative
+            // isolate spawns, then delivered port messages. Newly-scheduled
+            // microtasks always run before the next port message.
+            if let Some(task) = self.events.next_task() {
+                let input = json!([task.cb, Value::Null]).to_string();
+                let res = api::execute_vm_func_with_input(
+                    self.machine_id.clone(),
+                    DISPATCH_FN.to_string(),
+                    input,
+                    task.cb as i64,
+                );
+                let _ = self.drive(res);
+            } else if let Some((entry, msg)) = self.ports.pop_spawn() {
+                self.invoke_handler(&entry, msg);
+            } else if let Some((port, msg)) = self.ports.pop_message() {
+                let input = json!([port, msg]).to_string();
+                let res = api::execute_vm_func_with_input(
+                    self.machine_id.clone(),
+                    PORT_DISPATCH_FN.to_string(),
+                    input,
+                    port as i64,
+                );
+                let _ = self.drive(res);
+            } else {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     /// Invoke a named guest handler with a JSON argument, servicing its host
@@ -290,6 +312,7 @@ impl DartRuntime {
             "core" | "math" => self.core.dispatch(library, method, args),
             "convert" => crate::convert::dispatch(method, args),
             "async" => self.dispatch_async(method, args),
+            "isolate" => self.dispatch_isolate(method, args),
             other => Err(format!("unimplemented library dart:{other} (method {method})")),
         };
 
@@ -321,6 +344,15 @@ impl DartRuntime {
                 let delay = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0);
                 Ok(serde_json::json!(self.events.schedule_timer(cb, delay)))
             }
+            // Timer.periodic(cbId, intervalMs) -> timerId
+            "Timer.periodic" => {
+                let cb = args
+                    .first()
+                    .and_then(|v| v.as_u64())
+                    .ok_or("Timer.periodic requires a callback id")?;
+                let interval = args.get(1).and_then(|v| v.as_u64()).unwrap_or(1);
+                Ok(serde_json::json!(self.events.schedule_periodic(cb, interval)))
+            }
             // Timer.cancel(timerId) -> bool
             "Timer.cancel" => {
                 let id = args
@@ -330,6 +362,44 @@ impl DartRuntime {
                 Ok(serde_json::json!(self.events.cancel_timer(id)))
             }
             other => Err(format!("NoSuchMethodError: dart:async/{other}")),
+        }
+    }
+
+    /// `dart:isolate` native hooks: ports and cooperative spawn.
+    fn dispatch_isolate(&mut self, method: &str, args: &[Value]) -> Result<Value, String> {
+        match method {
+            // ReceivePort() -> portId
+            "ReceivePort" => Ok(json!(self.ports.new_receive_port())),
+            // SendPort.send(portId, message)
+            "SendPort.send" => {
+                let port = args
+                    .first()
+                    .and_then(|v| v.as_u64())
+                    .ok_or("SendPort.send requires a port id")?;
+                let msg = args.get(1).cloned().unwrap_or(Value::Null);
+                self.ports.send(port as u32, msg)?;
+                Ok(Value::Null)
+            }
+            // ReceivePort.close(portId)
+            "ReceivePort.close" => {
+                let port = args
+                    .first()
+                    .and_then(|v| v.as_u64())
+                    .ok_or("close requires a port id")?;
+                Ok(json!(self.ports.close(port as u32)))
+            }
+            // Isolate.spawn(entryFnName, message)
+            "Isolate.spawn" => {
+                let entry = args
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .ok_or("Isolate.spawn requires an entry name")?
+                    .to_string();
+                let msg = args.get(1).cloned().unwrap_or(Value::Null);
+                self.ports.spawn(entry, msg);
+                Ok(Value::Null)
+            }
+            other => Err(format!("NoSuchMethodError: dart:isolate/{other}")),
         }
     }
 }

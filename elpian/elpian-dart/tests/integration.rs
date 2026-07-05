@@ -268,3 +268,57 @@ fn signed_bundle_loads_and_runs_but_tamper_is_rejected() {
     let mut loader2 = BundleLoader::new(HmacSha256Scheme::new(key));
     assert!(loader2.accept(&evil).is_err());
 }
+
+/// Deepen P2: dart:isolate ports deliver messages to the guest in send order,
+/// and a cooperative Isolate.spawn runs a named entry with its message.
+#[test]
+fn isolate_ports_and_spawn() {
+    let code = r#"
+        function __portDispatch(a) {
+            askHost("test.emit", ["got:" + a[1]]);
+        }
+        function worker(msg) {
+            askHost("test.emit", ["worker:" + msg]);
+        }
+        var port = askHost("dart:isolate/ReceivePort", []);
+        askHost("dart:isolate/SendPort.send", [port, "one"]);
+        askHost("dart:isolate/SendPort.send", [port, "two"]);
+        askHost("dart:isolate/Isolate.spawn", ["worker", "hi"]);
+    "#;
+    let mut rt = DartRuntime::from_js(
+        "iso_test",
+        code,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    let out: Vec<String> = rt.emitted().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    // spawn drains before port messages in the pump priority order.
+    assert_eq!(out, vec!["worker:hi", "got:one", "got:two"]);
+}
+
+/// Deepen P2: a periodic timer fires repeatedly until the guest cancels it.
+#[test]
+fn periodic_timer_end_to_end() {
+    let code = r#"
+        var count = 0;
+        var id = 0;
+        function __dartDispatch(a) {
+            count = count + 1;
+            askHost("test.emit", ["tick" + count]);
+            if (count == 3) { askHost("dart:async/Timer.cancel", [id]); }
+        }
+        id = askHost("dart:async/Timer.periodic", [1, 10]);
+    "#;
+    let mut rt = DartRuntime::from_js(
+        "periodic_test",
+        code,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    let out: Vec<String> = rt.emitted().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    assert_eq!(out, vec!["tick1", "tick2", "tick3"]);
+}

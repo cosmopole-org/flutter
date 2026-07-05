@@ -47,6 +47,7 @@ pub mod core;
 pub mod dart_frontend;
 pub mod dart_ui;
 pub mod governance;
+pub mod isolate;
 pub mod sha256;
 pub mod runtime;
 pub mod typed_data;

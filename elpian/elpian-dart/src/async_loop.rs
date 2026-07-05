@@ -28,6 +28,8 @@ struct Timer {
     due: u64,
     seq: u64,
     cancelled: bool,
+    /// `Some(interval)` for a repeating `Timer.periodic`; `None` for one-shot.
+    period: Option<u64>,
 }
 
 /// A callback the runtime should now invoke on the guest.
@@ -70,6 +72,25 @@ impl EventLoop {
             due: self.now.saturating_add(delay_ms),
             seq,
             cancelled: false,
+            period: None,
+        });
+        id
+    }
+
+    /// `Timer.periodic(interval, cb)` — a repeating timer. Fires every
+    /// `interval` ms until cancelled; returns its id.
+    pub fn schedule_periodic(&mut self, cb: CallbackId, interval_ms: u64) -> u64 {
+        let id = self.next_timer_id;
+        self.next_timer_id += 1;
+        let seq = self.seq;
+        self.seq += 1;
+        self.timers.push(Timer {
+            id,
+            cb,
+            due: self.now.saturating_add(interval_ms),
+            seq,
+            cancelled: false,
+            period: Some(interval_ms.max(1)),
         });
         id
     }
@@ -120,6 +141,19 @@ impl EventLoop {
         let idx = best?;
         let t = self.timers.remove(idx);
         self.now = self.now.max(t.due);
+        // A periodic timer reschedules itself for the next interval.
+        if let Some(interval) = t.period {
+            let seq = self.seq;
+            self.seq += 1;
+            self.timers.push(Timer {
+                id: t.id,
+                cb: t.cb,
+                due: t.due.saturating_add(interval),
+                seq,
+                cancelled: false,
+                period: Some(interval),
+            });
+        }
         Some(DueTask { cb: t.cb, is_timer: true })
     }
 }
@@ -167,6 +201,25 @@ mod tests {
         assert!(l.cancel_timer(id));
         let order: Vec<CallbackId> = drain(&mut l).iter().map(|t| t.cb).collect();
         assert_eq!(order, vec![8]);
+    }
+
+    #[test]
+    fn periodic_timer_refires_until_cancelled() {
+        let mut l = EventLoop::new();
+        let id = l.schedule_periodic(9, 10);
+        let mut fires = 0;
+        // Drain a bounded number of ticks, cancelling after 3.
+        while let Some(t) = l.next_task() {
+            assert_eq!(t.cb, 9);
+            fires += 1;
+            if fires == 3 {
+                l.cancel_timer(id);
+            }
+            if fires > 10 {
+                break; // safety
+            }
+        }
+        assert_eq!(fires, 3, "periodic should fire exactly 3 times then stop");
     }
 
     #[test]
