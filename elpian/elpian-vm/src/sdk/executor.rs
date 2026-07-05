@@ -798,6 +798,16 @@ fn is_list_method(key: &str) -> bool {
     )
 }
 
+/// Higher-order `List` methods implemented as prelude functions (they take a
+/// closure, so they run as guest bytecode: `__List_<name>` bound to the receiver
+/// via `this`). Resolved by looking the function up in globals.
+fn is_list_prelude_method(key: &str) -> bool {
+    matches!(
+        key,
+        "map" | "where" | "forEach" | "fold" | "any" | "every" | "reduce"
+    )
+}
+
 /// Core `String` method names that resolve to a bound native method.
 fn is_string_method(key: &str) -> bool {
     matches!(
@@ -4810,6 +4820,19 @@ impl Executor {
                                 main_reg = Some(Val {
                                     typ: 253,
                                     data: Payload::from(Rc::new(RefCell::new(holder))),
+                                });
+                            } else if indexed.typ == 9 && is_list_prelude_method(&__key) {
+                                // Higher-order method: bind the prelude function
+                                // `__List_<name>` to the receiver (via `this`), so
+                                // it runs as guest bytecode and can call the guest
+                                // closure argument per element.
+                                let fname = format!("__List_{__key}");
+                                let g = self.ctx.find_val_globally(&fname);
+                                main_reg = Some(if g.typ == 10 {
+                                    let bound = g.as_func().borrow().bind(indexed.clone());
+                                    Val { typ: 10, data: Payload::from(Rc::new(RefCell::new(bound))) }
+                                } else {
+                                    Val { typ: 0, data: Payload::Null }
                                 });
                             } else if indexed.typ == 8 {
                                 let key = index.as_string();

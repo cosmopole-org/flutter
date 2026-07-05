@@ -24,9 +24,18 @@
 //! * `print(x)` lowered to `askHost("log",[x])`; `~/` lowered to a trunc-div
 //!   helper. `main()` is auto-invoked if present.
 //!
+//! * **closures / function expressions**: `(a) => expr`, `(a) { body }`, and
+//!   arrow bodies for function/method declarations (`int f() => expr;`). These
+//!   plus the VM's higher-order Iterable methods (`map`/`where`/`fold`/`reduce`/
+//!   `any`/`every`, bound in the VM to prelude functions) run real functional
+//!   Dart. Caveat: Elpian closures capture by *value*, so mutating a captured
+//!   outer variable (`forEach((e) => acc += e)`) does not propagate — thread
+//!   state through arguments (`fold`) instead.
+//!
 //! NOT yet covered (later phases): mixins, generics, named args, pattern
 //! matching, initializer lists with super-args, `async`/`await` sugar (the
-//! runtime primitives exist; the sugar is a later step).
+//! runtime primitives exist; the sugar is a later step), and by-reference
+//! closure capture.
 
 // ---------------------------------------------------------------------------
 // Tokens
@@ -311,6 +320,8 @@ impl<'a> Lexer<'a> {
             b'=' => {
                 if two(b'=', b'=', self) {
                     Tok::Op("==".into())
+                } else if two(b'=', b'>', self) {
+                    Tok::Op("=>".into())
                 } else {
                     Tok::Op("=".into())
                 }
@@ -389,6 +400,8 @@ enum Expr {
     Is(Box<Expr>, String),
     /// `expr as Type` — a reified cast.
     As(Box<Expr>, String),
+    /// A function expression / closure: `(params) => expr` or `(params) { body }`.
+    Closure(Vec<String>, Vec<Stmt>),
 }
 
 #[derive(Debug, Clone)]
@@ -558,7 +571,7 @@ impl Parser {
                         }
                     }
                     self.eat(&Tok::RParen)?;
-                    let body = self.parse_block()?;
+                    let body = self.parse_fn_body()?;
                     methods.push(Method { name: member_name, params, body });
                 }
             } else {
@@ -641,7 +654,8 @@ impl Parser {
             }
             k += 1;
         }
-        *self.peek_at(k) == Tok::LBrace
+        // A declaration body is a block `{` or an arrow `=>`.
+        *self.peek_at(k) == Tok::LBrace || matches!(self.peek_at(k), Tok::Op(o) if o == "=>")
     }
 
     fn parse_function(&mut self) -> Result<Item, String> {
@@ -662,7 +676,7 @@ impl Parser {
             }
         }
         self.eat(&Tok::RParen)?;
-        let body = self.parse_block()?;
+        let body = self.parse_fn_body()?;
         Ok(Item::Func(name, params, body))
     }
 
@@ -904,7 +918,78 @@ impl Parser {
         Ok(lhs)
     }
 
+    /// True when a `(` begins a closure param list (`(a) => …` or `(a) { … }`)
+    /// rather than a parenthesized expression.
+    fn looks_like_lambda(&self) -> bool {
+        if *self.peek() != Tok::LParen {
+            return false;
+        }
+        let mut k = 0;
+        let mut depth = 0;
+        loop {
+            match self.peek_at(k) {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        k += 1;
+                        break;
+                    }
+                }
+                Tok::Eof => return false,
+                _ => {}
+            }
+            k += 1;
+        }
+        matches!(self.peek_at(k), Tok::Op(o) if o == "=>") || *self.peek_at(k) == Tok::LBrace
+    }
+
+    fn parse_closure(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::LParen)?;
+        let mut params = Vec::new();
+        while *self.peek() != Tok::RParen {
+            if self.is_type_kw()
+                || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Ident(_)))
+            {
+                self.bump(); // erase the parameter type
+            }
+            params.push(self.ident()?);
+            if *self.peek() == Tok::Comma {
+                self.bump();
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        let body = self.parse_fn_body()?;
+        Ok(Expr::Closure(params, body))
+    }
+
+    /// A function/method body: a block, or an arrow body `=> expr;`.
+    fn parse_fn_body(&mut self) -> Result<Vec<Stmt>, String> {
+        if *self.peek() == Tok::Op("=>".into()) {
+            self.bump();
+            let e = self.parse_expr()?;
+            // A closure arrow body has no trailing `;`; a declaration does. Accept
+            // an optional semicolon so both forms parse.
+            if *self.peek() == Tok::Semi {
+                self.bump();
+            }
+            // Elpian treats assignment / update as a statement, not an expression,
+            // so `=> x = v` (common in `forEach`) becomes a statement body rather
+            // than `return (x = v)`, which the VM rejects.
+            let stmt = match e {
+                Expr::Assign(..) | Expr::AssignOp(..) | Expr::Update(..) => Stmt::Expr(e),
+                _ => Stmt::Return(Some(e)),
+            };
+            Ok(vec![stmt])
+        } else {
+            self.parse_block()
+        }
+    }
+
     fn parse_unary(&mut self) -> Result<Expr, String> {
+        if self.looks_like_lambda() {
+            return self.parse_closure();
+        }
         if let Tok::Op(o) = self.peek() {
             if o == "!" || o == "-" {
                 let op = o.clone();
@@ -1027,7 +1112,21 @@ fn binding_power(op: &str) -> Option<u8> {
 // Emitter (Dart AST -> Elpian JS subset)
 // ---------------------------------------------------------------------------
 
-const PRELUDE: &str = "function __truncDiv(a, b){ return (a - (a % b)) / b; }\n";
+/// Runtime prelude prepended to every program. `__truncDiv` backs `~/`; the
+/// `__List_*` functions implement the higher-order `Iterable` methods in the
+/// language itself (the VM's indexer binds them to the receiver as `this` when
+/// `list.map`/`.where`/… is read). They rely on `this.length`, `this[i]`,
+/// `out.add(...)`, and closure calls — all VM-supported.
+const PRELUDE: &str = concat!(
+    "function __truncDiv(a, b){ return (a - (a % b)) / b; }\n",
+    "function __List_map(f){ var out = []; var i = 0; while (i < this.length) { out.add(f(this[i])); i = i + 1; } return out; }\n",
+    "function __List_where(f){ var out = []; var i = 0; while (i < this.length) { if (f(this[i])) { out.add(this[i]); } i = i + 1; } return out; }\n",
+    "function __List_forEach(f){ var i = 0; while (i < this.length) { f(this[i]); i = i + 1; } return null; }\n",
+    "function __List_fold(init, f){ var acc = init; var i = 0; while (i < this.length) { acc = f(acc, this[i]); i = i + 1; } return acc; }\n",
+    "function __List_any(f){ var i = 0; while (i < this.length) { if (f(this[i])) { return true; } i = i + 1; } return false; }\n",
+    "function __List_every(f){ var i = 0; while (i < this.length) { if (!f(this[i])) { return false; } i = i + 1; } return true; }\n",
+    "function __List_reduce(f){ var acc = this[0]; var i = 1; while (i < this.length) { acc = f(acc, this[i]); i = i + 1; } return acc; }\n",
+);
 
 /// Transpile Dart-subset source to the JS subset the Elpian VM ingests.
 pub fn transpile(dart: &str) -> Result<String, String> {
@@ -1380,6 +1479,19 @@ impl Emitter {
             Expr::New(name, args) => {
                 let a: Vec<String> = args.iter().map(|x| self.emit_expr(x)).collect();
                 format!("new {}({})", name, a.join(", "))
+            }
+            Expr::Closure(params, body) => {
+                // Emit a JS function expression; params are locals in the body so
+                // bare field refs still resolve correctly around the closure.
+                let saved = std::mem::take(&mut self.out);
+                self.push_scope();
+                for p in params {
+                    self.declare(p);
+                }
+                self.emit_stmts(body, 1);
+                let body_str = std::mem::replace(&mut self.out, saved);
+                self.pop_scope();
+                format!("function({}) {{\n{}}}", params.join(", "), body_str)
             }
             Expr::Is(x, ty) => {
                 format!("askHost(\"dart:core/isType\", [{}, {}])", self.emit_expr(x), json_string(ty))

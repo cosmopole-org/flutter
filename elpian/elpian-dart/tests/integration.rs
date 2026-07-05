@@ -527,3 +527,48 @@ fn dart_core_type_methods() {
         ]
     );
 }
+
+/// VM+front-end conformance: closures and higher-order Iterable methods. The
+/// functional patterns (map/where/fold/reduce/any/every) — which thread state
+/// through arguments — run end-to-end from real Dart.
+///
+/// Note: Elpian closures capture by value, so mutating a captured outer variable
+/// (e.g. `forEach((e) => acc += e)`) does not propagate; use `fold`/`reduce`.
+#[test]
+fn dart_closures_and_higher_order() {
+    let dart = r#"
+        int sq(int x) => x * x;
+        void main() {
+            var xs = [1, 2, 3, 4, 5];
+            askHost("test.emit", [xs.map((e) => e * 2)]);
+            askHost("test.emit", [xs.where((e) => e % 2 == 1)]);
+            askHost("test.emit", [xs.fold(0, (a, b) => a + b)]);
+            askHost("test.emit", [xs.reduce((a, b) => a + b)]);
+            askHost("test.emit", [xs.any((e) => e > 4)]);
+            askHost("test.emit", [xs.every((e) => e > 0)]);
+            askHost("test.emit", [sq(6)]);
+            askHost("test.emit", [xs.map((e) => sq(e)).fold(0, (a, b) => a + b)]);
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "closures_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    assert_eq!(
+        rt.emitted(),
+        &[
+            serde_json::json!([2, 4, 6, 8, 10]),  // map
+            serde_json::json!([1, 3, 5]),         // where (odds)
+            serde_json::json!(15),                // fold sum
+            serde_json::json!(15),                // reduce sum
+            serde_json::json!(true),              // any > 4
+            serde_json::json!(true),              // every > 0
+            serde_json::json!(36),                // sq(6) arrow-body fn
+            serde_json::json!(55),                // sum of squares 1..5
+        ]
+    );
+}
