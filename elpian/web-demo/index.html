@@ -1,0 +1,87 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Elpian VM — dynamic Dart in the browser</title>
+  <style>
+    body { background: #111; color: #ddd; font-family: system-ui, sans-serif; }
+    canvas { background: #1e1e1e; border: 1px solid #444; }
+  </style>
+</head>
+<body>
+  <h3>Elpian VM (wasm) running a dynamically-loaded Dart miniapp</h3>
+  <canvas id="c" width="380" height="340"></canvas>
+  <pre id="log"></pre>
+  <script type="module">
+    const log = (m) => { document.getElementById('log').textContent += m + '\n'; };
+
+    // ARGB (0xAARRGGBB) -> css rgba(). Uses division to stay correct for
+    // values above 2^31 (JS bitwise ops are int32).
+    function argb(c) {
+      const a = Math.floor(c / 16777216) % 256;
+      const r = Math.floor(c / 65536) % 256;
+      const g = Math.floor(c / 256) % 256;
+      const b = c % 256;
+      return `rgba(${r},${g},${b},${a / 255})`;
+    }
+
+    // Rasterize the dart:ui scene tree to the canvas 2D context.
+    function paint(ctx, scene) {
+      const ops = (scene.root && scene.root.ops) || [];
+      let count = 0;
+      for (const op of ops) {
+        if (op.op === 'drawRect') {
+          const [l, t, r, b] = op.rect;
+          ctx.fillStyle = argb(op.color);
+          ctx.fillRect(l, t, r - l, b - t);
+          count++;
+        } else if (op.op === 'drawCircle') {
+          const [cx, cy] = op.center;
+          ctx.fillStyle = argb(op.color);
+          ctx.beginPath();
+          ctx.arc(cx, cy, op.radius, 0, Math.PI * 2);
+          ctx.fill();
+          count++;
+        } else if (op.op === 'drawParagraph') {
+          const [x, y] = op.offset;
+          ctx.fillStyle = argb(op.color);
+          ctx.font = `${op.fontSize}px sans-serif`;
+          ctx.fillText(op.text, x, y);
+          count++;
+        }
+      }
+      return count;
+    }
+
+    async function main() {
+      // Load the VM (wasm, no bindgen) and the Dart source.
+      const [wasmBytes, dartSrc] = await Promise.all([
+        fetch('elpian_dart.wasm').then(r => r.arrayBuffer()),
+        fetch('app.dart').then(r => r.text()),
+      ]);
+      const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+      const ex = instance.exports;
+
+      // Hand the Dart source to the VM and get the scene JSON back.
+      const enc = new TextEncoder().encode(dartSrc);
+      const ptr = ex.elpian_alloc(enc.length);
+      new Uint8Array(ex.memory.buffer, ptr, enc.length).set(enc);
+      const len = ex.elpian_run(ptr, enc.length);
+      const rptr = ex.elpian_result_ptr();
+      const json = new TextDecoder().decode(new Uint8Array(ex.memory.buffer, rptr, len));
+
+      log('scene: ' + json.slice(0, 200) + (json.length > 200 ? '…' : ''));
+      const scene = JSON.parse(json);
+      if (scene.error) { window.__error = scene.error; log('ERROR: ' + scene.error); return; }
+
+      const ctx = document.getElementById('c').getContext('2d');
+      const drawn = paint(ctx, scene);
+      log('painted ' + drawn + ' ops');
+      window.__opsPainted = drawn;
+      window.__rendered = true;
+    }
+
+    main().catch(e => { window.__error = String(e); log('EXC: ' + e); });
+  </script>
+</body>
+</html>

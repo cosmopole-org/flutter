@@ -54,6 +54,7 @@ pub mod runtime;
 pub mod typed_data;
 pub mod types;
 pub mod value;
+pub mod wasm_api;
 
 pub use core::Clock;
 pub use governance::{DartCapability, DartCapabilitySet, ResourceMeter};

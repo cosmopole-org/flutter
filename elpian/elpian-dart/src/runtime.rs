@@ -125,6 +125,12 @@ impl DartRuntime {
         Ok(rt)
     }
 
+    /// The scene the guest most recently submitted via `FlutterView.render`
+    /// (e.g. during `main()`), for a host/rasterizer to paint.
+    pub fn last_scene(&self) -> Option<Value> {
+        self.current_frame.clone()
+    }
+
     /// Pin the clock (and thus `DateTime.now`) for reproducible runs/tests.
     pub fn with_fixed_clock(mut self, millis_since_epoch: i64) -> Self {
         self.core = CoreRuntime::new(Clock::Fixed(millis_since_epoch));
