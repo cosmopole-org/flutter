@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Elpian VM — interactive Dart miniapp</title>
+  <style>
+    body { background: #111; color: #ddd; font-family: system-ui, sans-serif; }
+    canvas { background: #1e1e1e; border: 1px solid #444; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h3>Interactive: click the button — the VM handles the event and re-renders</h3>
+  <canvas id="c" width="340" height="240"></canvas>
+  <script type="module">
+    function argb(c) {
+      const a = Math.floor(c / 16777216) % 256, r = Math.floor(c / 65536) % 256;
+      const g = Math.floor(c / 256) % 256, b = c % 256;
+      return `rgba(${r},${g},${b},${a / 255})`;
+    }
+    function paint(ctx, scene) {
+      ctx.clearRect(0, 0, 340, 240);
+      for (const op of (scene.root && scene.root.ops) || []) {
+        ctx.fillStyle = argb(op.color);
+        if (op.op === 'drawRect') { const [l, t, r, b] = op.rect; ctx.fillRect(l, t, r - l, b - t); }
+        else if (op.op === 'drawCircle') { const [x, y] = op.center; ctx.beginPath(); ctx.arc(x, y, op.radius, 0, 7); ctx.fill(); }
+        else if (op.op === 'drawParagraph') { const [x, y] = op.offset; ctx.font = `${op.fontSize}px sans-serif`; ctx.fillText(op.text, x, y); }
+      }
+    }
+
+    let ex, ctx;
+    function readResult() {
+      const len = window.__lastLen;
+      const rptr = ex.elpian_result_ptr();
+      return JSON.parse(new TextDecoder().decode(new Uint8Array(ex.memory.buffer, rptr, len)));
+    }
+    function frame() {
+      window.__lastLen = ex.elpian_frame();
+      paint(ctx, readResult());
+    }
+
+    async function main() {
+      const [wasmBytes, src] = await Promise.all([
+        fetch('elpian_dart.wasm').then(r => r.arrayBuffer()),
+        fetch('counter.dart').then(r => r.text()),
+      ]);
+      const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+      ex = instance.exports;
+      ctx = document.getElementById('c').getContext('2d', { willReadFrequently: true });
+
+      const enc = new TextEncoder().encode(src);
+      const ptr = ex.elpian_alloc(enc.length);
+      new Uint8Array(ex.memory.buffer, ptr, enc.length).set(enc);
+      ex.elpian_init(ptr, enc.length);
+      frame(); // initial render
+
+      const canvas = document.getElementById('c');
+      canvas.addEventListener('click', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        ex.elpian_pointer(e.clientX - rect.left, e.clientY - rect.top, 1);
+        frame();
+      });
+      window.__ready = true;
+    }
+    main().catch((e) => { window.__error = String(e); });
+  </script>
+</body>
+</html>

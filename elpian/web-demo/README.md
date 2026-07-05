@@ -37,6 +37,18 @@ node test.mjs      # -> "E2E PASSED", writes rendered.png
 The test fails the process (non-zero exit) if any swatch/circle pixel is wrong
 or the canvas is blank, so it doubles as CI.
 
+### Interactive variant
+
+`counter.dart` + `interactive.html` + `interactive_test.mjs` demonstrate the
+**event loop**: a tappable button whose real browser clicks (`page.mouse.click`)
+run the VM's `onPointerEvent` handler, mutate a counter, and re-render. The
+persistent-runtime wasm API (`elpian_init` / `elpian_pointer` / `elpian_frame`)
+keeps VM state across frames.
+
+```sh
+node interactive_test.mjs    # clicks the button, asserts the bar grows -> INTERACTIVE E2E PASSED
+```
+
 ## Honest scope
 
 This is the **Elpian renderer**, not Flutter's CanvasKit/WebGL engine. It proves

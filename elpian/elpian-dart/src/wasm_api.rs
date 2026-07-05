@@ -14,9 +14,14 @@
 
 use std::sync::Mutex;
 
+use crate::binding::{PointerEvent, PointerPhase};
 use crate::{DartCapabilitySet, DartRuntime, ResourceMeter};
 
 static RESULT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// A persistent runtime for the interactive loop (init once, then pointer +
+/// frame repeatedly).
+static LIVE: Mutex<Option<DartRuntime>> = Mutex::new(None);
 
 /// Reserve `len` bytes in wasm memory and return a pointer the host writes to.
 #[no_mangle]
@@ -57,6 +62,56 @@ pub unsafe extern "C" fn elpian_run(ptr: *const u8, len: usize) -> usize {
 #[no_mangle]
 pub extern "C" fn elpian_result_ptr() -> *const u8 {
     RESULT.lock().unwrap().as_ptr()
+}
+
+// ---- interactive loop: init once, then pointer/frame repeatedly ------------
+
+/// Compile + run a Dart program once (defining its handlers) and keep the
+/// runtime live for interaction. Returns 0 on success, 1 on failure.
+///
+/// # Safety
+/// `ptr`/`len` must describe valid UTF-8 bytes in memory.
+#[no_mangle]
+pub unsafe extern "C" fn elpian_init(ptr: *const u8, len: usize) -> i32 {
+    let src = std::str::from_utf8(std::slice::from_raw_parts(ptr, len)).unwrap_or("");
+    let id = format!("live-{}", next_id());
+    match DartRuntime::from_dart(id, src, DartCapabilitySet::full(), ResourceMeter::unbounded()) {
+        Ok(rt) => {
+            let mut rt = rt.with_fixed_clock(0);
+            let _ = rt.run();
+            *LIVE.lock().unwrap() = Some(rt);
+            0
+        }
+        Err(_) => 1,
+    }
+}
+
+/// Deliver a pointer event to the live runtime's `onPointerEvent` handler.
+#[no_mangle]
+pub extern "C" fn elpian_pointer(x: f64, y: f64, down: i32) {
+    if let Some(rt) = LIVE.lock().unwrap().as_mut() {
+        let phase = if down == 1 { PointerPhase::Down } else { PointerPhase::Up };
+        rt.dispatch_pointer(PointerEvent { pointer: 1, phase, x, y });
+    }
+}
+
+/// Render one frame from the live runtime and store its scene JSON; returns the
+/// JSON byte length (read via [`elpian_result_ptr`]).
+#[no_mangle]
+pub extern "C" fn elpian_frame() -> usize {
+    let json = if let Some(rt) = LIVE.lock().unwrap().as_mut() {
+        let scene = rt.render_frame(0).or_else(|| rt.last_scene());
+        match scene {
+            Some(s) => s.to_string(),
+            None => "{\"error\":\"no frame\"}".to_string(),
+        }
+    } else {
+        "{\"error\":\"not initialized\"}".to_string()
+    };
+    let bytes = json.into_bytes();
+    let n = bytes.len();
+    *RESULT.lock().unwrap() = bytes;
+    n
 }
 
 fn run_to_scene_json(src: &str) -> String {
