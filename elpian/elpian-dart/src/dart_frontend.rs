@@ -32,10 +32,19 @@
 //!   outer variable (`forEach((e) => acc += e)`) does not propagate — thread
 //!   state through arguments (`fold`) instead.
 //!
-//! NOT yet covered (later phases): mixins, generics, named args, pattern
-//! matching, initializer lists with super-args, `async`/`await` sugar (the
-//! runtime primitives exist; the sugar is a later step), and by-reference
-//! closure capture.
+//! * **named & optional parameters** (`{this.width}`, `[int x = 0]`, `required`)
+//!   with defaults, lowered to a trailing options object; named arguments at
+//!   call sites; and **generic type args** in type positions (erased).
+//! * **`async`/`await`**: `async` functions are CPS-transformed to return a
+//!   `Future` built from `.then` continuations driven by the microtask loop;
+//!   `await` sequences them. Bounded: awaits are transformed only at statement
+//!   top level (var init, expression statement, `return await`) — awaits nested
+//!   inside loops, conditionals, or sub-expressions need full state-machine
+//!   lowering and are not yet handled.
+//!
+//! NOT yet covered (later phases): mixins, pattern matching, initializer lists
+//! with super-args, async closures / awaits inside control flow, generic
+//! *typed-local* declarations, and by-reference closure capture.
 
 // ---------------------------------------------------------------------------
 // Tokens
@@ -75,7 +84,8 @@ enum StrPart {
 
 const KEYWORDS: &[&str] = &[
     "var", "final", "if", "else", "while", "for", "return", "void", "int", "double", "num",
-    "String", "bool", "dynamic", "class", "extends", "this", "new", "super", "is", "as",
+    "String", "bool", "dynamic", "class", "extends", "this", "new", "super", "is", "as", "async",
+    "await",
 ];
 
 // ---------------------------------------------------------------------------
@@ -402,6 +412,8 @@ enum Expr {
     As(Box<Expr>, String),
     /// A function expression / closure: `(params) => expr` or `(params) { body }`.
     Closure(ParamList, Vec<Stmt>),
+    /// `await expr` inside an `async` function.
+    Await(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -451,6 +463,7 @@ struct Method {
     name: String,
     params: ParamList,
     body: Vec<Stmt>,
+    is_async: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -467,7 +480,7 @@ struct ClassDecl {
 
 #[derive(Debug, Clone)]
 enum Item {
-    Func(String, ParamList, Vec<Stmt>),
+    Func(String, ParamList, Vec<Stmt>, bool /* is_async */),
     Class(ClassDecl),
     Stmt(Stmt),
 }
@@ -557,14 +570,11 @@ impl Parser {
         let mut has_ctor = false;
 
         while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
-            // Optional leading type (primitive kw, or `Type name` where Type is
-            // an identifier followed by another identifier).
-            if self.is_type_kw()
-                || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Ident(_)))
-                || *self.peek() == Tok::Kw("var".into())
-                || *self.peek() == Tok::Kw("final".into())
-            {
-                self.bump(); // erase the type / var / final
+            // Optional leading `var`/`final` or a type annotation (incl. generics).
+            if *self.peek() == Tok::Kw("var".into()) || *self.peek() == Tok::Kw("final".into()) {
+                self.bump();
+            } else {
+                self.maybe_skip_type();
             }
             let member_name = self.ident()?;
             if *self.peek() == Tok::LParen {
@@ -582,8 +592,9 @@ impl Parser {
                     };
                 } else {
                     let params = self.parse_param_list()?;
+                    let is_async = self.eat_async_modifier();
                     let body = self.parse_fn_body()?;
-                    methods.push(Method { name: member_name, params, body });
+                    methods.push(Method { name: member_name, params, body, is_async });
                 }
             } else {
                 // field: optional initializer, then ';'
@@ -611,16 +622,61 @@ impl Parser {
         })
     }
 
-    fn looks_like_function(&self) -> bool {
-        let mut k = 0;
-        if self.is_type_kw() {
-            k += 1;
-        }
-        // need: ident '(' ... ')' '{'
-        if !matches!(self.peek_at(k), Tok::Ident(_)) {
-            return false;
+    /// Non-consuming: index just past an optional type (keyword or identifier,
+    /// with balanced `<...>` generic arguments) starting at `k`.
+    fn skip_type_at(&self, mut k: usize) -> usize {
+        let is_type_start = matches!(self.peek_at(k), Tok::Ident(_))
+            || matches!(self.peek_at(k), Tok::Kw(kw)
+                if matches!(kw.as_str(), "int"|"double"|"num"|"String"|"bool"|"void"|"dynamic"));
+        if !is_type_start {
+            return k;
         }
         k += 1;
+        if matches!(self.peek_at(k), Tok::Op(o) if o == "<") {
+            let mut depth = 0;
+            loop {
+                match self.peek_at(k) {
+                    Tok::Op(o) if o == "<" => depth += 1,
+                    Tok::Op(o) if o == ">" => {
+                        depth -= 1;
+                        k += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    Tok::Eof => break,
+                    _ => {}
+                }
+                k += 1;
+            }
+        }
+        k
+    }
+
+    /// Consuming: skip a type annotation iff it is immediately followed by an
+    /// identifier (the declared name), so a bare `name` is not eaten as a type.
+    fn maybe_skip_type(&mut self) {
+        let at = self.skip_type_at(0);
+        if at > 0 && matches!(self.peek_at(at), Tok::Ident(_)) {
+            for _ in 0..at {
+                self.bump();
+            }
+        }
+    }
+
+    fn looks_like_function(&self) -> bool {
+        // Optional return type (incl. generics), then the name.
+        let after_type = self.skip_type_at(0);
+        let name_pos = if after_type > 0 && matches!(self.peek_at(after_type), Tok::Ident(_)) {
+            after_type
+        } else {
+            0
+        };
+        if !matches!(self.peek_at(name_pos), Tok::Ident(_)) {
+            return false;
+        }
+        let mut k = name_pos + 1;
         if *self.peek_at(k) != Tok::LParen {
             return false;
         }
@@ -641,18 +697,33 @@ impl Parser {
             }
             k += 1;
         }
-        // A declaration body is a block `{` or an arrow `=>`.
-        *self.peek_at(k) == Tok::LBrace || matches!(self.peek_at(k), Tok::Op(o) if o == "=>")
+        // A declaration body is a block `{`, an arrow `=>`, or `async` first.
+        *self.peek_at(k) == Tok::LBrace
+            || matches!(self.peek_at(k), Tok::Op(o) if o == "=>")
+            || *self.peek_at(k) == Tok::Kw("async".into())
     }
 
     fn parse_function(&mut self) -> Result<Item, String> {
-        if self.is_type_kw() {
-            self.bump();
-        }
+        self.maybe_skip_type(); // optional return type (incl. generics)
         let name = self.ident()?;
         let params = self.parse_param_list()?;
+        let is_async = self.eat_async_modifier();
         let body = self.parse_fn_body()?;
-        Ok(Item::Func(name, params, body))
+        Ok(Item::Func(name, params, body, is_async))
+    }
+
+    /// Consume an `async` (or `async*`/`sync*`, treated as `async`) body modifier.
+    fn eat_async_modifier(&mut self) -> bool {
+        if *self.peek() == Tok::Kw("async".into()) {
+            self.bump();
+            // async* — ignore the `*` (streams not modelled yet).
+            if matches!(self.peek(), Tok::Op(o) if o == "*") {
+                self.bump();
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Parse a `( ... )` formal parameter list: required-positional, plus an
@@ -700,10 +771,8 @@ impl Parser {
             self.bump();
             self.eat(&Tok::Dot)?;
             is_this = true;
-        } else if self.is_type_kw()
-            || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Ident(_)))
-        {
-            self.bump(); // erase the declared type
+        } else {
+            self.maybe_skip_type(); // erase the declared type (incl. generics)
         }
         let name = self.ident()?;
         let default = if *self.peek() == Tok::Op("=".into()) {
@@ -1037,6 +1106,11 @@ impl Parser {
         if self.looks_like_lambda() {
             return self.parse_closure();
         }
+        if *self.peek() == Tok::Kw("await".into()) {
+            self.bump();
+            let e = self.parse_unary()?;
+            return Ok(Expr::Await(Box::new(e)));
+        }
         if let Tok::Op(o) = self.peek() {
             if o == "!" || o == "-" {
                 let op = o.clone();
@@ -1157,6 +1231,14 @@ const PRELUDE: &str = concat!(
     "function __List_any(f){ var i = 0; while (i < this.length) { if (f(this[i])) { return true; } i = i + 1; } return false; }\n",
     "function __List_every(f){ var i = 0; while (i < this.length) { if (!f(this[i])) { return false; } i = i + 1; } return true; }\n",
     "function __List_reduce(f){ var acc = this[0]; var i = 1; while (i < this.length) { acc = f(acc, this[i]); i = i + 1; } return acc; }\n",
+    // ---- async/await runtime: Future + microtask-driven continuations -------
+    "var __cbReg = [];\n",
+    "function __later(fn){ var id = __cbReg.length; __cbReg.add(fn); askHost(\"dart:async/scheduleMicrotask\", [id]); }\n",
+    "function __dartDispatch(a){ var fn = __cbReg[a[0]]; fn(); }\n",
+    "function __schedThen(value, cb, next){ __later(function(){ var r = cb(value); if (r != null && r.__isFuture) { r.then(function(rv){ next.complete(rv); }); } else { next.complete(r); } }); }\n",
+    "class _Future { constructor(){ this.__isFuture = true; this.done = false; this.value = null; this.cbs = []; } then(cb){ var next = new _Future(); if (this.done) { __schedThen(this.value, cb, next); } else { var p = {}; p.cb = cb; p.next = next; this.cbs.add(p); } return next; } complete(v){ if (this.done) { return; } this.done = true; this.value = v; var i = 0; while (i < this.cbs.length) { var p = this.cbs[i]; __schedThen(v, p.cb, p.next); i = i + 1; } } }\n",
+    "function __Future_value(v){ var f = new _Future(); __later(function(){ f.complete(v); }); return f; }\n",
+    "function __await(x){ if (x != null && x.__isFuture) { return x; } return __Future_value(x); }\n",
 );
 
 /// Transpile Dart-subset source to the JS subset the Elpian VM ingests.
@@ -1359,7 +1441,7 @@ impl Emitter {
         let mut has_main = false;
         for item in items {
             match item {
-                Item::Func(name, params, body) => {
+                Item::Func(name, params, body, is_async) => {
                     if name == "main" {
                         has_main = true;
                     }
@@ -1368,7 +1450,11 @@ impl Emitter {
                     self.push_scope();
                     self.declare_params(params);
                     self.emit_param_prologue(params, 1);
-                    self.emit_stmts(body, 1);
+                    if *is_async {
+                        self.emit_async_seq(body, 1);
+                    } else {
+                        self.emit_stmts(body, 1);
+                    }
                     self.pop_scope();
                     self.out.push_str("}\n");
                 }
@@ -1432,7 +1518,11 @@ impl Emitter {
             self.push_scope();
             self.declare_params(&m.params);
             self.emit_param_prologue(&m.params, 2);
-            self.emit_stmts(&m.body, 2);
+            if m.is_async {
+                self.emit_async_seq(&m.body, 2);
+            } else {
+                self.emit_stmts(&m.body, 2);
+            }
             self.pop_scope();
             self.out.push_str("  }\n");
         }
@@ -1447,6 +1537,65 @@ impl Emitter {
         for s in stmts {
             self.emit_stmt(s, depth);
         }
+    }
+
+    /// Lower the body of an `async` function to CPS: each top-level `await`
+    /// splits the remaining statements into a `.then` continuation, and the
+    /// function returns a `Future` (via `__Future_value` / the awaited future).
+    /// Bounded: only awaits at statement top level (var init, expression
+    /// statement, or `return await`) are transformed; awaits nested inside loops,
+    /// conditionals, or sub-expressions are not (documented limitation).
+    fn emit_async_seq(&mut self, stmts: &[Stmt], depth: usize) {
+        let mut i = 0;
+        while i < stmts.len() {
+            match &stmts[i] {
+                Stmt::Var(name, Some(Expr::Await(e))) => {
+                    let ev = self.emit_expr(e);
+                    self.indent(depth);
+                    self.out.push_str(&format!("return __await({ev}).then(function({name}) {{\n"));
+                    self.push_scope();
+                    self.declare(name);
+                    self.emit_async_seq(&stmts[i + 1..], depth + 1);
+                    self.pop_scope();
+                    self.indent(depth);
+                    self.out.push_str("});\n");
+                    return;
+                }
+                Stmt::Expr(Expr::Await(e)) => {
+                    let ev = self.emit_expr(e);
+                    self.indent(depth);
+                    self.out.push_str(&format!("return __await({ev}).then(function(__u) {{\n"));
+                    self.push_scope();
+                    self.emit_async_seq(&stmts[i + 1..], depth + 1);
+                    self.pop_scope();
+                    self.indent(depth);
+                    self.out.push_str("});\n");
+                    return;
+                }
+                Stmt::Return(Some(Expr::Await(e))) => {
+                    let ev = self.emit_expr(e);
+                    self.indent(depth);
+                    self.out.push_str(&format!("return __await({ev});\n"));
+                    return;
+                }
+                Stmt::Return(Some(e)) => {
+                    let ev = self.emit_expr(e);
+                    self.indent(depth);
+                    self.out.push_str(&format!("return __Future_value({ev});\n"));
+                    return;
+                }
+                Stmt::Return(None) => {
+                    self.indent(depth);
+                    self.out.push_str("return __Future_value(null);\n");
+                    return;
+                }
+                s => self.emit_stmt(s, depth),
+            }
+            i += 1;
+        }
+        // No explicit return: an async function still yields a completed Future.
+        self.indent(depth);
+        self.out.push_str("return __Future_value(null);\n");
     }
 
     fn emit_stmt(&mut self, s: &Stmt, depth: usize) {
@@ -1587,6 +1736,10 @@ impl Emitter {
                 self.pop_scope();
                 format!("function({}) {{\n{}}}", sig.join(", "), body_str)
             }
+            // A stray/nested await (outside the CPS statement positions) can't
+            // suspend; surface the awaited future's wrapper so it at least
+            // type-checks. Top-level awaits are handled by emit_async_seq.
+            Expr::Await(e) => format!("__await({})", self.emit_expr(e)),
             Expr::Is(x, ty) => {
                 format!("askHost(\"dart:core/isType\", [{}, {}])", self.emit_expr(x), json_string(ty))
             }

@@ -610,3 +610,39 @@ fn dart_named_parameters() {
         ]
     );
 }
+
+/// VM+front-end conformance: async/await via CPS transform on the microtask
+/// event loop. Async functions return Futures; awaits sequence through `.then`
+/// continuations. Covers awaiting another async function, sequential awaits, and
+/// delivering the result via `.then`.
+#[test]
+fn dart_async_await() {
+    let dart = r#"
+        Future<int> delayedValue(int v) async { return v; }
+        Future<int> sumTwo() async {
+            var a = await delayedValue(10);
+            var b = await delayedValue(20);
+            return a + b;
+        }
+        Future<String> label() async {
+            var n = await sumTwo();
+            return "total=" + n;
+        }
+        void main() {
+            sumTwo().then((r) => askHost("test.emit", [r]));
+            label().then((s) => askHost("test.emit", [s]));
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "async_await_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    // Both futures resolve during the microtask pump; order is deterministic.
+    let out = rt.emitted();
+    assert!(out.contains(&serde_json::json!(30)), "sumTwo -> 30, got {out:?}");
+    assert!(out.contains(&serde_json::json!("total=30")), "label -> total=30, got {out:?}");
+}
