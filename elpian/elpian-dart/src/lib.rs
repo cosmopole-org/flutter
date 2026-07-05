@@ -40,10 +40,13 @@
 //! is the foundation that a Dart front-end + framework port targets.
 
 pub mod async_loop;
+pub mod binding;
+pub mod bundle;
 pub mod core;
 pub mod dart_frontend;
 pub mod dart_ui;
 pub mod governance;
+pub mod sha256;
 pub mod runtime;
 pub mod typed_data;
 pub mod types;

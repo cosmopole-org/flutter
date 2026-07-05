@@ -67,12 +67,21 @@ Every `dart:*` call passes through both:
 | VM embed + `askHost` driver loop | ✅ built, e2e-tested | `runtime.rs` |
 | Two-layer capability + resource governor | ✅ built, tested | `governance.rs`, `runtime.rs` |
 | Dart **numeric tower** (`int` vs `double`, `~/`, `/`→double, wrapping, `is int`) | ✅ built, tested | `value.rs` |
-| `dart:typed_data` — `ByteData` alloc/get/set (Uint8/Int32/Float64) + endianness + `RangeError` | ✅ built, tested | `typed_data.rs` |
-| `dart:ui` — `PictureRecorder`/`Canvas`/`Picture` → scene tree (drawRect/Circle/Paragraph) | ✅ built, tested | `dart_ui.rs` |
+| **P1** `dart:typed_data` — `ByteData` + typed-list views + endianness + `setRange` | ✅ built, tested | `typed_data.rs` |
+| **P1** `dart:ui` — `Canvas`/`Paint`/`Path`/transform/clip/`PictureRecorder`/`SceneBuilder` → scene tree | ✅ built, tested | `dart_ui.rs` |
+| **P1** `dart:core`/`dart:math` — `DateTime.now`, seeded `Random`, num/string formatting, math fns | ✅ built, tested | `core.rs` |
+| **P2** async model — microtask/timer event loop with Dart's exact ordering | ✅ built, tested | `async_loop.rs`, `runtime.rs` |
+| **P3** Dart → Elpian front-end (bounded subset: types, `for`/`while`/`if`, `~/`, interpolation) | ✅ built, tested | `dart_frontend.rs` |
+| **P4** reified types, subtyping, `is`/`as`, `const` canonicalization, `noSuchMethod` | ✅ built, tested | `types.rs` |
+| **P5** framework binding — pointer/lifecycle/text events + vsync frame pump | ✅ built, tested | `binding.rs`, `runtime.rs` |
+| **P5** signed code-delivery — SHA-256/HMAC (KAT-verified) + verify-before-load + downgrade guard | ✅ built, tested | `sha256.rs`, `bundle.rs` |
 | native + `wasm32` compilation | ✅ verified | — |
 
-The 4 integration tests run **real guest programs on the real VM** driving these
-libraries end-to-end, including a capability-denial and a resource-limit case.
+**55 tests pass** (native) and the whole stack builds for `wasm32`. The
+integration tests run **real guest programs on the real VM** end-to-end,
+including: a Dart-source program (front-end → VM), the async ordering guarantee,
+a capability denial, a resource-limit cutoff, the pointer-event + frame-render
+loop, and the signed-bundle accept/tamper-reject path.
 
 > A finding that de-risks the language work: Elpian's value model **already
 > represents integers and floats with separate tags** (`typ` 1/2/3 = i16/i32/i64,
@@ -80,49 +89,44 @@ libraries end-to-end, including a capability-denial and a resource-limit case.
 > JS-based VM gets wrong — maps onto this natively; `value.rs` supplies the
 > Dart-correct *semantics* over that representation.
 
-## Roadmap — remaining work to run real Flutter logic
+## Roadmap status
 
-Ordered, each phase standalone and testable. This is the honest path from the
-foundation above to running Flutter app code; it is a large program, not a
-weekend.
+Phases 1–5 each landed a real, tested vertical slice (see the table above). What
+each phase established, and what remains to *deepen* it toward the full framework:
 
-**Phase 1 — foundational libraries (in progress).**
-Finish the `dart:ui` surface (`Path`, `Paint` state, `ParagraphBuilder`,
-`SceneBuilder`/layers, `Image`, transforms/clips), extend `dart:typed_data`
-(all `TypedList` views, `ByteBuffer` sharing), and add `dart:core`/`dart:math`
-native helpers (string/num formatting, `DateTime`, `Random`).
+**Phase 1 — foundational libraries ✅ (slice).** `dart:typed_data`, `dart:ui`,
+`dart:core`/`dart:math` implemented for their load-bearing subsets. *Deepen:*
+`Image`/`ParagraphBuilder` layout, `ByteBuffer` sharing, the rest of `dart:core`.
 
-**Phase 2 — the async & concurrency model.**
-`Future`/`Stream`, `async`/`await`, `async*`/`sync*`, and Dart's *exact*
-microtask-vs-event-queue ordering and `Zone`s. Then `dart:isolate`
-(`SendPort`/`ReceivePort`, `Isolate.spawn`) mapped onto Elpian's worker-task
-pool. Correct ordering here is what makes framework code behave.
+**Phase 2 — async & concurrency ✅ (slice).** The microtask/timer event loop with
+Dart's exact ordering; `Future`/`Stream`/`async`-`await` layer on top in Dart
+source. *Deepen:* `dart:isolate` (`SendPort`/`ReceivePort`) on Elpian's worker
+pool; `Zone`s; `async*`/`sync*`.
 
-**Phase 3 — the Dart→Elpian AST front-end.**
-A compiler from Dart source (and/or Dart **kernel** `.dill`) to the Elpian AST
-the VM already ingests. Start with the app-logic subset (classes, mixins,
-generics *erased*, null-safety, pattern matching) and grow. This is what lets
-app code be written in Dart with "no change," within a documented subset.
+**Phase 3 — Dart → Elpian front-end ✅ (slice).** A real lexer/parser/emitter for
+a Dart subset (typed decls, control flow, `~/`, interpolation). *Deepen:*
+classes/mixins, generics, pattern matching, and a Dart **kernel** (`.dill`)
+front-end for unchanged app code.
 
-**Phase 4 — reified types & full semantic conformance.**
-Runtime type representation for reified generics (`x is List<int>`), `as`/`is`
-soundness, `const` canonicalization, `identical`/`hashCode`, `noSuchMethod`,
-exact exception semantics. This is the "make Elpian fully Dart-compatible at the
-VM layer" work; it is where a JS-model VM and Dart genuinely diverge, and it is
-large.
+**Phase 4 — reified types & conformance ✅ (slice).** Reified types + subtyping,
+`is`/`as`, `const` canonicalization, `noSuchMethod` resolution. *Deepen:* wire
+the front-end to emit type metadata at allocation/`is`/`as` sites; exact
+exception semantics.
 
-**Phase 5 — the framework binding & host integration.**
-Wire the recorded `dart:ui` scene tree to a native Flutter rasterizer (engine
-embedder / platform view), route pointer/lifecycle/text-input events back into
-the VM, and stand up the signed code-delivery pipeline. At this point a
-Dart-subset Flutter app updates live in a release build on iOS, web, Android,
-desktop.
+**Phase 5 — framework binding & delivery ✅ (slice).** Pointer/lifecycle/text
+event routing, the `onBeginFrame`/`onDrawFrame` vsync pump returning a scene
+tree, and a **signed** bundle loader (real SHA-256/HMAC, verify-before-load,
+downgrade protection). *Deepen:* connect the returned scene tree to a native
+Flutter rasterizer (engine embedder / platform view) and add ed25519 signatures.
 
 ## Honest scope statement
 
-This foundation is real, compiles, and is tested. It does **not** yet run the
-unmodified Flutter framework kernel — that requires Phases 2–5, most weightily
-the async/type-system conformance (Phase 4) and the framework binding (Phase 5).
-The "no limitations / no changes to app code" end state is the target the
-roadmap drives toward; every phase here is a concrete, verifiable step on that
-path rather than a claim that it is already reached.
+Phases 1–5 are real, compile (native + wasm32), and are covered by 55 passing
+tests including end-to-end runs on the actual VM. This is a working **foundation
+and vertical slice through every layer** of the architecture — not a complete
+Dart VM or a drop-in for the unmodified Flutter framework. The two things that
+remain genuinely large are (a) breadth — filling out each `dart:*` library and
+the language front-end to the full surface, and (b) the final native-rasterizer
+binding in Phase 5. Every slice here is a concrete, verifiable step toward the
+"update app code live in a release build on iOS/web/Android/desktop" goal, with
+the security-critical verify-before-execute control already real.

@@ -15,6 +15,7 @@ use elpian_vm::api::{self, VmExecResult};
 use elpian_vm::sdk::capabilities::Capability;
 
 use crate::async_loop::EventLoop;
+use crate::binding::{handlers, AppLifecycleState, PointerEvent, RENDER_METHOD};
 use crate::core::{Clock, CoreRuntime};
 use crate::dart_ui::SceneRecorder;
 use crate::governance::{required_capability, DartCapability, DartCapabilitySet, ResourceMeter};
@@ -55,6 +56,8 @@ pub struct DartRuntime {
     core: CoreRuntime,
     events: EventLoop,
     max_pump_tasks: u64,
+    /// The scene the guest submitted via `FlutterView.render` this frame.
+    current_frame: Option<Value>,
     emitted: Vec<Value>,
     log: Vec<String>,
     denied: Vec<String>,
@@ -84,6 +87,7 @@ impl DartRuntime {
             core: CoreRuntime::new(Clock::System),
             events: EventLoop::new(),
             max_pump_tasks: DEFAULT_MAX_PUMP_TASKS,
+            current_frame: None,
             emitted: Vec::new(),
             log: Vec::new(),
             denied: Vec::new(),
@@ -186,6 +190,47 @@ impl DartRuntime {
         Ok(())
     }
 
+    /// Invoke a named guest handler with a JSON argument, servicing its host
+    /// calls and flushing any microtasks it schedules. A missing handler is a
+    /// harmless no-op (the VM returns without error).
+    fn invoke_handler(&mut self, name: &str, arg: Value) {
+        // The guest handler receives `arg` directly as its single parameter,
+        // exactly like `onEvent(ev)`.
+        let input = arg.to_string();
+        let res =
+            api::execute_vm_func_with_input(self.machine_id.clone(), name.to_string(), input, 0);
+        let _ = self.drive(res);
+        let _ = self.pump();
+    }
+
+    // ---- framework binding: host -> guest events & the frame pipeline -----
+
+    /// Deliver a pointer (touch/mouse) event to the guest's `onPointerEvent`.
+    pub fn dispatch_pointer(&mut self, event: PointerEvent) {
+        self.invoke_handler(handlers::POINTER, event.to_json());
+    }
+
+    /// Deliver an app-lifecycle transition.
+    pub fn dispatch_lifecycle(&mut self, state: AppLifecycleState) {
+        self.invoke_handler(handlers::LIFECYCLE, json!(state.as_str()));
+    }
+
+    /// Deliver a text-input update.
+    pub fn dispatch_text(&mut self, text: &str) {
+        self.invoke_handler(handlers::TEXT_INPUT, json!({ "text": text }));
+    }
+
+    /// Produce one frame: call `onBeginFrame(t)` then `onDrawFrame()`, and
+    /// return the scene tree the guest submitted via `FlutterView.render`
+    /// (or `None` if it rendered nothing). This is the vsync tick a real engine
+    /// would drive, and the returned scene is what the native rasterizer paints.
+    pub fn render_frame(&mut self, frame_time_micros: i64) -> Option<Value> {
+        self.current_frame = None;
+        self.invoke_handler(handlers::BEGIN_FRAME, json!(frame_time_micros));
+        self.invoke_handler(handlers::DRAW_FRAME, Value::Null);
+        self.current_frame.take()
+    }
+
     /// Service one `{machineId, apiName, payload}` envelope, returning the JSON
     /// value to resume the guest with.
     fn service(&mut self, envelope_json: &str) -> Value {
@@ -230,6 +275,13 @@ impl DartRuntime {
         if let Err(e) = self.meter.charge(bytes) {
             self.denied.push(format!("dart:{lib_and_method}"));
             return dart_error(&e);
+        }
+
+        // The frame-submission call is serviced by the runtime, not the
+        // recorder: it captures the scene tree for the host to rasterize.
+        if library == "ui" && method == RENDER_METHOD {
+            self.current_frame = args.first().cloned();
+            return Value::Null;
         }
 
         let result = match library {

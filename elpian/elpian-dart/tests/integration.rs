@@ -1,6 +1,8 @@
 //! End-to-end tests: real guest code runs on the Elpian VM and drives the
 //! `dart:*` foundational libraries through the governed host seam.
 
+use elpian_dart::binding::{PointerEvent, PointerPhase};
+use elpian_dart::bundle::{BundleLoader, CodeBundle, HmacSha256Scheme};
 use elpian_dart::{DartCapability, DartCapabilitySet, DartRuntime, ResourceMeter};
 
 /// A `dart:typed_data` round-trip driven entirely from guest code: allocate a
@@ -188,4 +190,81 @@ fn resource_meter_bounds_host_calls() {
     rt.run().expect("runs");
     // Once the ceiling is hit, subsequent dart: calls are denied.
     assert!(!rt.denied().is_empty(), "meter should have denied calls");
+}
+
+/// Phase 5: the framework binding end-to-end. A Dart guest defines pointer and
+/// frame handlers; the runtime delivers a tap and drives a frame, and the guest
+/// renders a scene the host collects — exactly the engine <-> framework loop.
+#[test]
+fn binding_delivers_events_and_collects_a_frame() {
+    let dart = r#"
+        var taps = 0;
+        void onPointerEvent(e) {
+            taps = taps + 1;
+            askHost("test.emit", ["tap$taps"]);
+        }
+        void onDrawFrame() {
+            askHost("dart:ui/PictureRecorder.beginRecording", []);
+            askHost("dart:ui/Canvas.drawRect", [0.0, 0.0, 10.0, 10.0, 4278190080]);
+            var pic = askHost("dart:ui/PictureRecorder.endRecording", []);
+            var scene = askHost("dart:ui/Picture.toScene", [pic]);
+            askHost("dart:ui/FlutterView.render", [scene]);
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "binding_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("dart compiles");
+    rt.run().expect("defines handlers");
+
+    // Deliver two taps.
+    rt.dispatch_pointer(PointerEvent { pointer: 1, phase: PointerPhase::Down, x: 5.0, y: 5.0 });
+    rt.dispatch_pointer(PointerEvent { pointer: 1, phase: PointerPhase::Up, x: 5.0, y: 5.0 });
+    assert_eq!(
+        rt.emitted(),
+        &[serde_json::json!("tap1"), serde_json::json!("tap2")]
+    );
+
+    // Drive a frame; the guest renders a rectangle scene the host collects.
+    let frame = rt.render_frame(16_000).expect("guest rendered a frame");
+    assert_eq!(frame["root"]["ops"][0]["op"], "drawRect");
+}
+
+/// Phase 5: the signed code-delivery path, from signing to a verified run.
+#[test]
+fn signed_bundle_loads_and_runs_but_tamper_is_rejected() {
+    let key = *b"deployment-signing-key";
+    let signer = BundleLoader::new(HmacSha256Scheme::new(key));
+
+    let mut bundle = CodeBundle {
+        id: "app.counter".into(),
+        version: 7,
+        entrypoint: "main".into(),
+        source: r#"void main() { askHost("test.emit", ["v7"]); }"#.into(),
+        signature: Vec::new(),
+    };
+    signer.sign(&mut bundle);
+
+    // Device side: verify before loading.
+    let mut loader = BundleLoader::new(HmacSha256Scheme::new(key));
+    let trusted_source = loader.accept(&bundle).expect("valid bundle accepted");
+    let mut rt = DartRuntime::from_dart(
+        "bundle_run",
+        &trusted_source,
+        DartCapabilitySet::sandboxed(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    assert_eq!(rt.emitted(), &[serde_json::json!("v7")]);
+
+    // A tampered bundle never yields source, so it can never reach the VM.
+    let mut evil = bundle.clone();
+    evil.version = 8;
+    evil.source = r#"void main() { askHost("test.emit", ["pwned"]); }"#.into();
+    let mut loader2 = BundleLoader::new(HmacSha256Scheme::new(key));
+    assert!(loader2.accept(&evil).is_err());
 }
