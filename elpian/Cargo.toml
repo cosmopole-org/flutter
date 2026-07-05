@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["elpian-vm", "elpian-dart"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
