@@ -67,6 +67,9 @@ pub struct DartRuntime {
     last_frame: Option<Value>,
     /// Class hierarchy for reified `is`/`as` checks over instances.
     class_table: crate::types::ClassTable,
+    /// Set when the guest requests a repaint via `dart:ui/scheduleFrame` (e.g.
+    /// from `setState`), so the host knows a new frame is due.
+    needs_frame: bool,
     emitted: Vec<Value>,
     log: Vec<String>,
     denied: Vec<String>,
@@ -100,6 +103,7 @@ impl DartRuntime {
             current_frame: None,
             last_frame: None,
             class_table: crate::types::ClassTable::new(),
+            needs_frame: false,
             emitted: Vec::new(),
             log: Vec::new(),
             denied: Vec::new(),
@@ -123,6 +127,37 @@ impl DartRuntime {
             rt.class_table.register(name, superclass.as_deref(), &[], &[]);
         }
         Ok(rt)
+    }
+
+    /// Build a runtime from a **Flutter-style widget app**: the user's
+    /// `StatelessWidget`/`StatefulWidget` source with a `main()` that calls
+    /// `runApp(...)`. The [`crate::widgets`] framework prelude is prepended, then
+    /// the whole program takes the same Dart → AST → bytecode → VM path as
+    /// [`from_dart`](Self::from_dart). Drive it with [`render_frame`] on each
+    /// vsync and [`dispatch_pointer`] for input.
+    ///
+    /// [`render_frame`]: Self::render_frame
+    /// [`dispatch_pointer`]: Self::dispatch_pointer
+    pub fn from_widget_app(
+        machine_id: impl Into<String>,
+        app_source: &str,
+        caps: DartCapabilitySet,
+        meter: ResourceMeter,
+    ) -> Result<Self, DartError> {
+        let composed = crate::widgets::compose(app_source);
+        Self::from_dart(machine_id, &composed, caps, meter)
+    }
+
+    /// Whether the guest has requested a repaint since the last
+    /// [`clear_needs_frame`](Self::clear_needs_frame) (i.e. a `setState` ran).
+    /// A host frame scheduler polls this to coalesce repaints.
+    pub fn needs_frame(&self) -> bool {
+        self.needs_frame
+    }
+
+    /// Clear the pending-repaint flag (call after producing a frame).
+    pub fn clear_needs_frame(&mut self) {
+        self.needs_frame = false;
     }
 
     /// The scene the guest most recently submitted via `FlutterView.render`
@@ -334,6 +369,13 @@ impl DartRuntime {
         // recorder: it captures the scene tree for the host to rasterize.
         if library == "ui" && method == RENDER_METHOD {
             self.current_frame = args.first().cloned();
+            return Value::Null;
+        }
+
+        // A repaint request (from `setState`/`runApp`) is a runtime signal, not a
+        // recorder op: flag it so the host schedules the next frame.
+        if library == "ui" && method == "scheduleFrame" {
+            self.needs_frame = true;
             return Value::Null;
         }
 

@@ -16,8 +16,10 @@
 //!   (`ClassName(args)`), member access, and `this`. Bare field/method
 //!   references inside methods resolve to `this.member` (including inherited
 //!   members), so idiomatic Dart lowers to valid JS classes;
-//! * `if`/`else`, `while`, C-style `for` (lowered to `while`), `return`, blocks;
-//! * expressions: literals, identifiers, calls, list literals, indexing,
+//! * `if`/`else`, `while`, C-style `for` and **`for-in`** (both lowered to
+//!   `while`), `return`, blocks;
+//! * expressions: literals (incl. **hex integers** `0xFF2196F3` for colours),
+//!   identifiers, calls, list literals, indexing,
 //!   assignment + compound assignment (`+= -= *= /=`), `++`/`--`, ternary
 //!   `?:`, `|| && == != < <= > >= + - * / % ~/`, unary `! -`;
 //! * string interpolation (`"$x"`, `"${expr}"`) lowered to concatenation;
@@ -177,6 +179,19 @@ impl<'a> Lexer<'a> {
 
     fn lex_number(&mut self) -> Result<Tok, String> {
         let start = self.pos;
+        // Hex integer literal (`0xFF2196F3`) — common for ARGB colours.
+        if self.peek() == b'0' && (self.peek2() == b'x' || self.peek2() == b'X') {
+            self.pos += 2;
+            let hstart = self.pos;
+            while self.peek().is_ascii_hexdigit() {
+                self.pos += 1;
+            }
+            if self.pos == hstart {
+                return Err("bad hex literal".into());
+            }
+            let s = std::str::from_utf8(&self.src[hstart..self.pos]).unwrap();
+            return Ok(Tok::Int(i64::from_str_radix(s, 16).map_err(|_| "bad hex literal")?));
+        }
         let mut is_double = false;
         while self.peek().is_ascii_digit() {
             self.pos += 1;
@@ -497,6 +512,9 @@ struct Parser {
     toks: Vec<Tok>,
     i: usize,
     class_names: std::collections::HashSet<String>,
+    /// Monotonic counter for synthesizing unique temporaries (e.g. the iterator
+    /// and index locals a `for-in` loop desugars to).
+    for_seq: usize,
 }
 
 impl Parser {
@@ -511,7 +529,7 @@ impl Parser {
                 }
             }
         }
-        Parser { toks, i: 0, class_names }
+        Parser { toks, i: 0, class_names, for_seq: 0 }
     }
 
     fn peek(&self) -> &Tok {
@@ -940,6 +958,10 @@ impl Parser {
     fn parse_for(&mut self) -> Result<Stmt, String> {
         self.bump();
         self.eat(&Tok::LParen)?;
+        // A `for-in` header has no top-level `;` before the closing `)`.
+        if self.header_is_for_in() {
+            return self.parse_for_in();
+        }
         let init = if *self.peek() == Tok::Semi {
             self.bump();
             None
@@ -969,6 +991,92 @@ impl Parser {
         }
         block.push(while_stmt);
         Ok(Stmt::Block(block))
+    }
+
+    /// True if the tokens from the current position (just past `for (`) are a
+    /// `for-in` header — i.e. there is no top-level `;` before the matching `)`.
+    fn header_is_for_in(&self) -> bool {
+        let mut k = 0usize;
+        let mut depth = 0i32;
+        loop {
+            match self.peek_at(k) {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    if depth == 0 {
+                        return true;
+                    }
+                    depth -= 1;
+                }
+                Tok::Semi if depth == 0 => return false,
+                Tok::Eof => return false,
+                _ => {}
+            }
+            k += 1;
+        }
+    }
+
+    /// Parse `for (<var> in <iterable>) <body>` and desugar it to an indexed
+    /// `while` over `<iterable>.length`, re-declaring the loop variable each
+    /// iteration (Dart's closure-capture semantics). The `(` is already consumed.
+    fn parse_for_in(&mut self) -> Result<Stmt, String> {
+        // Optional `var` / `final`.
+        if matches!(self.peek(), Tok::Kw(k) if k == "var" || k == "final") {
+            self.bump();
+        }
+        // Optional type annotation: only skip it when a type is followed by the
+        // loop-variable identifier which is itself followed by `in` — so a bare
+        // `name in` is never mistaken for a `Type name`.
+        let in_tok = Tok::Ident("in".into());
+        let after_type = self.skip_type_at(0);
+        let has_type = after_type > 0
+            && matches!(self.peek_at(after_type), Tok::Ident(_))
+            && self.peek_at(after_type) != &in_tok
+            && self.peek_at(after_type + 1) == &in_tok;
+        if has_type {
+            for _ in 0..after_type {
+                self.bump();
+            }
+        }
+        let name = match self.bump() {
+            Tok::Ident(n) => n,
+            other => return Err(format!("for-in expected a loop variable, found {other:?}")),
+        };
+        self.eat(&in_tok)?;
+        let iter = self.parse_expr()?;
+        self.eat(&Tok::RParen)?;
+        let mut body = self.stmt_as_block()?;
+
+        let n = self.for_seq;
+        self.for_seq += 1;
+        let it = format!("__for_it{n}");
+        let idx = format!("__for_i{n}");
+        let idx_read = || Expr::Ident(idx.clone());
+
+        // var name = __forIt[__forI];
+        let mut loop_body = vec![Stmt::Var(
+            name,
+            Some(Expr::Index(
+                Box::new(Expr::Ident(it.clone())),
+                Box::new(idx_read()),
+            )),
+        )];
+        loop_body.append(&mut body);
+        // __forI = __forI + 1;
+        loop_body.push(Stmt::Expr(Expr::Assign(
+            Box::new(idx_read()),
+            Box::new(Expr::Binary("+".into(), Box::new(idx_read()), Box::new(Expr::Int(1)))),
+        )));
+
+        let cond = Expr::Binary(
+            "<".into(),
+            Box::new(idx_read()),
+            Box::new(Expr::Member(Box::new(Expr::Ident(it.clone())), "length".into())),
+        );
+        Ok(Stmt::Block(vec![
+            Stmt::Var(it, Some(iter)),
+            Stmt::Var(idx, Some(Expr::Int(0))),
+            Stmt::While(cond, loop_body),
+        ]))
     }
 
     fn stmt_as_block(&mut self) -> Result<Vec<Stmt>, String> {
@@ -2201,6 +2309,20 @@ mod tests {
         let js = transpile(r#"var s = "n=$x done";"#).unwrap();
         assert!(js.contains('+'), "interpolation should concat: {js}");
         assert!(js.contains("(x)"), "should reference x: {js}");
+    }
+
+    #[test]
+    fn for_in_desugars_to_indexed_while() {
+        // Typed loop var, bare form, and a C-style `for` in the same program all
+        // parse; the for-in lowers to a length-bounded while over the iterable.
+        let js = transpile(
+            "void main() { for (var x in xs) { total = total + x; } \
+             for (int i = 0; i < 3; i = i + 1) { print(i); } }",
+        )
+        .unwrap();
+        assert!(js.contains("__for_it0"), "for-in should bind an iterator temp: {js}");
+        assert!(js.contains(".length"), "for-in should bound on length: {js}");
+        assert!(js.contains("while"), "for-in lowers to while: {js}");
     }
 
     #[test]

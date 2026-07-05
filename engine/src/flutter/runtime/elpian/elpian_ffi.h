@@ -17,6 +17,10 @@
 //   * `elpian_alloc(n)` reserves n bytes and returns a pointer to write into.
 //   * `elpian_init(ptr, len)` compiles + runs the bundle at ptr..+len (defining
 //     its onPointerEvent / onDrawFrame handlers) and keeps the runtime live.
+//   * `elpian_init_widgets(ptr, len)` is the same, but the bundle is authored as
+//     a *Flutter-style widget app* (StatelessWidget/StatefulWidget + build() +
+//     runApp): the widget framework is prepended, so onDrawFrame builds, lays
+//     out, and paints the widget tree, and onPointerEvent hit-tests taps.
 //   * `elpian_pointer(x, y, down)` delivers a pointer event to the guest.
 //   * `elpian_frame()` renders one frame and stores the scene-tree JSON,
 //     returning its byte length; read it at `elpian_result_ptr()`.
@@ -28,6 +32,8 @@ void elpian_free(uint8_t* ptr, size_t len);
 
 // Returns 0 on success, 1 on compile/load failure.
 int32_t elpian_init(const uint8_t* ptr, size_t len);
+// As elpian_init, but the bundle is a widget app (runApp + widget classes).
+int32_t elpian_init_widgets(const uint8_t* ptr, size_t len);
 void elpian_pointer(double x, double y, int32_t down);
 size_t elpian_frame();
 const uint8_t* elpian_result_ptr();

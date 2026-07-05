@@ -86,6 +86,25 @@ pub unsafe extern "C" fn elpian_init(ptr: *const u8, len: usize) -> i32 {
     }
 }
 
+/// Initialize the live runtime from a **Flutter-style widget app** (the
+/// [`crate::widgets`] framework prelude is prepended). Same lifecycle as
+/// [`elpian_init`]: `elpian_pointer` delivers taps, `elpian_frame` renders.
+/// Returns 0 on success, 1 on a compile error.
+#[no_mangle]
+pub unsafe extern "C" fn elpian_init_widgets(ptr: *const u8, len: usize) -> i32 {
+    let src = std::str::from_utf8(std::slice::from_raw_parts(ptr, len)).unwrap_or("");
+    let id = format!("live-{}", next_id());
+    match DartRuntime::from_widget_app(id, src, DartCapabilitySet::full(), ResourceMeter::unbounded()) {
+        Ok(rt) => {
+            let mut rt = rt.with_fixed_clock(0);
+            let _ = rt.run();
+            *LIVE.lock().unwrap() = Some(rt);
+            0
+        }
+        Err(_) => 1,
+    }
+}
+
 /// Deliver a pointer event to the live runtime's `onPointerEvent` handler.
 #[no_mangle]
 pub extern "C" fn elpian_pointer(x: f64, y: f64, down: i32) {

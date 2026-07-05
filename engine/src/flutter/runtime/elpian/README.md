@@ -25,15 +25,30 @@ The bundle's own widget/scene specification and logic decide what is drawn —
 different bundles render different widgets with no engine rebuild, which is the
 "Miniapp / dynamic Flutter" goal.
 
+## Two ways to author a bundle
+
+- **`LoadBundle`** — the bundle defines the engine handlers itself
+  (`onDrawFrame`/`onPointerEvent`) and paints via raw `dart:ui` calls. Lowest
+  level; total control over the scene.
+- **`LoadWidgetApp`** — the bundle is **real Flutter-style widget code**:
+  `StatelessWidget`/`StatefulWidget` classes with `build()` methods, nested child
+  widgets, `GestureDetector`, and a `main()` that calls `runApp(...)`. The
+  [widget framework](../../../../../elpian/elpian-dart/src/widgets.rs) is prepended
+  by the VM layer; it owns the handlers and, each frame, **builds → lays out →
+  paints** the widget tree into the same `dart:ui` scene, and hit-tests taps so
+  `setState` drives the next frame. This is the path that runs an app written the
+  way you'd write it in Flutter. It is exercised end-to-end (VM tests + a
+  headless-browser pixel test, `elpian/web-demo/widgets_test.mjs`).
+
 ## How it slots in
 
 - **`elpian_ffi.h`** — the C ABI of the `elpian-dart` crate. These are the exact
   `#[no_mangle] extern "C"` symbols the crate's test suite and the wasm/browser
   build exercise, so the runtime the engine embeds is the tested one; the C++ is
   only glue.
-- **`ElpianRuntime`** — `LoadBundle` (compile+run, defining `onDrawFrame` /
-  `onPointerEvent`), `DispatchPointer`, and `RenderFrame` (invoke the guest,
-  parse its `dart:ui` scene JSON, and build a `DisplayList`).
+- **`ElpianRuntime`** — `LoadBundle` / `LoadWidgetApp` (compile+run; the latter
+  prepends the widget framework), `DispatchPointer`, and `RenderFrame` (invoke the
+  guest, parse its `dart:ui` scene JSON, and build a `DisplayList`).
 - To wire it into a shell: construct an `ElpianRuntime` where a `RuntimeController`
   would own a `DartIsolate`; forward `PlatformDispatcher` pointer packets to
   `DispatchPointer`; and, on `onBeginFrame`/`onDrawFrame`, submit
