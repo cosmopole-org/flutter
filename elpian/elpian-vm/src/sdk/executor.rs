@@ -4352,9 +4352,14 @@ impl Executor {
                                 args.insert("this".to_string(), receiver);
                             }
                             for (i, param_name) in expected_params.iter().enumerate() {
-                                let arg = provided_args.get(i).cloned().unwrap_or_else(|| {
-                                    Val::new(0, Payload::Null)
-                                });
+                                // A parameter with no supplied argument binds to null
+                                // (integer 0), so Dart optional/named params default
+                                // correctly via `== null` rather than a typed-
+                                // undefined that breaks comparisons and arithmetic.
+                                let arg = provided_args
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or_else(|| Val::new(1, Payload::from(0i16)));
                                 args.insert(param_name.clone(), arg);
                             }
                             self.ctx
@@ -4844,10 +4849,11 @@ impl Executor {
                                     // receiver, so `obj.method(args)` runs with `this`.
                                     main_reg = Some(bound);
                                 } else {
-                                    main_reg = Some(Val {
-                                        typ: 0,
-                                        data: Payload::Null,
-                                    });
+                                    // An absent key/field reads as null (which the VM
+                                    // models as integer 0), matching Dart's
+                                    // `map[absent] == null` — not the typed-undefined
+                                    // sentinel, so `x == null` guards work.
+                                    main_reg = Some(self.check_int_range(0));
                                 }
                             } else {
                                 eprintln!(

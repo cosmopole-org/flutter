@@ -572,3 +572,41 @@ fn dart_closures_and_higher_order() {
         ]
     );
 }
+
+/// VM+front-end conformance: named and optional parameters — the Flutter
+/// constructor/callback idiom. Named ctor params (`{this.x}`), named params with
+/// defaults, and named arguments at call sites all run from real Dart.
+#[test]
+fn dart_named_parameters() {
+    let dart = r#"
+        class Box {
+            Box(this.label, {this.width, this.height});
+            String describe() { return label + ":" + width + "x" + height; }
+        }
+        int scaled(int base, {int factor = 2, int offset = 0}) => base * factor + offset;
+        void main() {
+            var b = Box("btn", width: "10", height: "20");
+            askHost("test.emit", [b.describe()]);
+            askHost("test.emit", [scaled(5)]);
+            askHost("test.emit", [scaled(5, factor: 3)]);
+            askHost("test.emit", [scaled(5, factor: 3, offset: 1)]);
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "named_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    assert_eq!(
+        rt.emitted(),
+        &[
+            serde_json::json!("btn:10x20"),
+            serde_json::json!(10),   // 5*2 + 0
+            serde_json::json!(15),   // 5*3 + 0
+            serde_json::json!(16),   // 5*3 + 1
+        ]
+    );
+}

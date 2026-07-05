@@ -388,20 +388,20 @@ enum Expr {
     /// `++`/`--`; the bool is true for prefix form.
     Update(String, Box<Expr>, bool),
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
-    Call(Box<Expr>, Vec<Expr>),
+    Call(Box<Expr>, Vec<Expr>, Vec<(String, Expr)>),
     Index(Box<Expr>, Box<Expr>),
     /// Member access `obj.name`.
     Member(Box<Expr>, String),
     /// `this`.
     This,
     /// Instantiation `ClassName(args)` — Dart has no `new` keyword required.
-    New(String, Vec<Expr>),
+    New(String, Vec<Expr>, Vec<(String, Expr)>),
     /// `expr is Type` — a reified type test.
     Is(Box<Expr>, String),
     /// `expr as Type` — a reified cast.
     As(Box<Expr>, String),
     /// A function expression / closure: `(params) => expr` or `(params) { body }`.
-    Closure(Vec<String>, Vec<Stmt>),
+    Closure(ParamList, Vec<Stmt>),
 }
 
 #[derive(Debug, Clone)]
@@ -414,17 +414,42 @@ enum Stmt {
     Block(Vec<Stmt>),
 }
 
+/// A single formal parameter.
 #[derive(Debug, Clone)]
-struct CtorParam {
+struct Param {
     name: String,
-    /// `this.x` shorthand — assigns the field directly.
+    /// `this.x` shorthand (constructors) — assigns the field directly.
     is_this: bool,
+    /// Default value for optional-positional / named params.
+    default: Option<Expr>,
 }
+
+/// A parsed parameter list: required-positional, optional-positional (`[...]`),
+/// and named (`{...}`). Named params are lowered to a single trailing options
+/// object; optional-positional to trailing params with null-default fill-in.
+#[derive(Debug, Clone, Default)]
+struct ParamList {
+    positional: Vec<Param>,
+    optional_pos: Vec<Param>,
+    named: Vec<Param>,
+}
+
+impl ParamList {
+    fn all_this_params(&self) -> impl Iterator<Item = &Param> {
+        self.positional
+            .iter()
+            .chain(self.optional_pos.iter())
+            .chain(self.named.iter())
+            .filter(|p| p.is_this)
+    }
+}
+
+const NAMED_ARG: &str = "__named";
 
 #[derive(Debug, Clone)]
 struct Method {
     name: String,
-    params: Vec<String>,
+    params: ParamList,
     body: Vec<Stmt>,
 }
 
@@ -433,7 +458,7 @@ struct ClassDecl {
     name: String,
     superclass: Option<String>,
     fields: Vec<(String, Option<Expr>)>,
-    ctor_params: Vec<CtorParam>,
+    ctor_params: ParamList,
     ctor_body: Vec<Stmt>,
     has_ctor: bool,
     calls_super: bool,
@@ -442,7 +467,7 @@ struct ClassDecl {
 
 #[derive(Debug, Clone)]
 enum Item {
-    Func(String, Vec<String>, Vec<Stmt>),
+    Func(String, ParamList, Vec<Stmt>),
     Class(ClassDecl),
     Stmt(Stmt),
 }
@@ -527,7 +552,7 @@ impl Parser {
         self.eat(&Tok::LBrace)?;
         let mut fields = Vec::new();
         let mut methods = Vec::new();
-        let mut ctor_params = Vec::new();
+        let mut ctor_params = ParamList::default();
         let mut ctor_body = Vec::new();
         let mut has_ctor = false;
 
@@ -546,7 +571,7 @@ impl Parser {
                 // constructor or method
                 if member_name == name {
                     has_ctor = true;
-                    ctor_params = self.parse_ctor_params()?;
+                    ctor_params = self.parse_param_list()?;
                     // A constructor body may be a block or just `;` (common with
                     // initializing formals: `Counter(this.value);`).
                     ctor_body = if *self.peek() == Tok::Semi {
@@ -556,21 +581,7 @@ impl Parser {
                         self.parse_block()?
                     };
                 } else {
-                    self.eat(&Tok::LParen)?;
-                    let mut params = Vec::new();
-                    while *self.peek() != Tok::RParen {
-                        if self.is_type_kw()
-                            || (matches!(self.peek(), Tok::Ident(_))
-                                && matches!(self.peek_at(1), Tok::Ident(_)))
-                        {
-                            self.bump();
-                        }
-                        params.push(self.ident()?);
-                        if *self.peek() == Tok::Comma {
-                            self.bump();
-                        }
-                    }
-                    self.eat(&Tok::RParen)?;
+                    let params = self.parse_param_list()?;
                     let body = self.parse_fn_body()?;
                     methods.push(Method { name: member_name, params, body });
                 }
@@ -598,30 +609,6 @@ impl Parser {
             calls_super,
             methods,
         })
-    }
-
-    fn parse_ctor_params(&mut self) -> Result<Vec<CtorParam>, String> {
-        self.eat(&Tok::LParen)?;
-        let mut params = Vec::new();
-        while *self.peek() != Tok::RParen {
-            if *self.peek() == Tok::Kw("this".into()) {
-                self.bump();
-                self.eat(&Tok::Dot)?;
-                params.push(CtorParam { name: self.ident()?, is_this: true });
-            } else {
-                if self.is_type_kw()
-                    || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Ident(_)))
-                {
-                    self.bump();
-                }
-                params.push(CtorParam { name: self.ident()?, is_this: false });
-            }
-            if *self.peek() == Tok::Comma {
-                self.bump();
-            }
-        }
-        self.eat(&Tok::RParen)?;
-        Ok(params)
     }
 
     fn looks_like_function(&self) -> bool {
@@ -663,21 +650,94 @@ impl Parser {
             self.bump();
         }
         let name = self.ident()?;
+        let params = self.parse_param_list()?;
+        let body = self.parse_fn_body()?;
+        Ok(Item::Func(name, params, body))
+    }
+
+    /// Parse a `( ... )` formal parameter list: required-positional, plus an
+    /// optional-positional group `[ ... ]` and/or a named group `{ ... }`.
+    fn parse_param_list(&mut self) -> Result<ParamList, String> {
         self.eat(&Tok::LParen)?;
-        let mut params = Vec::new();
+        let mut pl = ParamList::default();
         while *self.peek() != Tok::RParen {
-            // optional type then name
-            if self.is_type_kw() || matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Ident(_)) {
-                self.bump(); // erase the type
+            if *self.peek() == Tok::LBracket {
+                self.bump();
+                while *self.peek() != Tok::RBracket {
+                    pl.optional_pos.push(self.parse_one_param()?);
+                    if *self.peek() == Tok::Comma {
+                        self.bump();
+                    }
+                }
+                self.eat(&Tok::RBracket)?;
+            } else if *self.peek() == Tok::LBrace {
+                self.bump();
+                while *self.peek() != Tok::RBrace {
+                    pl.named.push(self.parse_one_param()?);
+                    if *self.peek() == Tok::Comma {
+                        self.bump();
+                    }
+                }
+                self.eat(&Tok::RBrace)?;
+            } else {
+                pl.positional.push(self.parse_one_param()?);
+                if *self.peek() == Tok::Comma {
+                    self.bump();
+                }
             }
-            params.push(self.ident()?);
+        }
+        self.eat(&Tok::RParen)?;
+        Ok(pl)
+    }
+
+    fn parse_one_param(&mut self) -> Result<Param, String> {
+        // `required` is a contextual modifier (an identifier in our lexer).
+        if matches!(self.peek(), Tok::Ident(s) if s == "required") {
+            self.bump();
+        }
+        let mut is_this = false;
+        if *self.peek() == Tok::Kw("this".into()) {
+            self.bump();
+            self.eat(&Tok::Dot)?;
+            is_this = true;
+        } else if self.is_type_kw()
+            || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Ident(_)))
+        {
+            self.bump(); // erase the declared type
+        }
+        let name = self.ident()?;
+        let default = if *self.peek() == Tok::Op("=".into()) {
+            self.bump();
+            // Dart const defaults: drop a leading `const`.
+            if matches!(self.peek(), Tok::Ident(s) if s == "const") {
+                self.bump();
+            }
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Param { name, is_this, default })
+    }
+
+    /// Parse a call argument list into (positional, named) argument groups.
+    fn parse_args(&mut self) -> Result<(Vec<Expr>, Vec<(String, Expr)>), String> {
+        self.eat(&Tok::LParen)?;
+        let mut pos = Vec::new();
+        let mut named = Vec::new();
+        while *self.peek() != Tok::RParen {
+            if matches!(self.peek(), Tok::Ident(_)) && *self.peek_at(1) == Tok::Colon {
+                let n = self.ident()?;
+                self.eat(&Tok::Colon)?;
+                named.push((n, self.parse_expr()?));
+            } else {
+                pos.push(self.parse_expr()?);
+            }
             if *self.peek() == Tok::Comma {
                 self.bump();
             }
         }
         self.eat(&Tok::RParen)?;
-        let body = self.parse_fn_body()?;
-        Ok(Item::Func(name, params, body))
+        Ok((pos, named))
     }
 
     fn ident(&mut self) -> Result<String, String> {
@@ -945,20 +1005,7 @@ impl Parser {
     }
 
     fn parse_closure(&mut self) -> Result<Expr, String> {
-        self.eat(&Tok::LParen)?;
-        let mut params = Vec::new();
-        while *self.peek() != Tok::RParen {
-            if self.is_type_kw()
-                || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Ident(_)))
-            {
-                self.bump(); // erase the parameter type
-            }
-            params.push(self.ident()?);
-            if *self.peek() == Tok::Comma {
-                self.bump();
-            }
-        }
-        self.eat(&Tok::RParen)?;
+        let params = self.parse_param_list()?;
         let body = self.parse_fn_body()?;
         Ok(Expr::Closure(params, body))
     }
@@ -1012,22 +1059,14 @@ impl Parser {
         loop {
             match self.peek() {
                 Tok::LParen => {
-                    self.bump();
-                    let mut args = Vec::new();
-                    while *self.peek() != Tok::RParen {
-                        args.push(self.parse_expr()?);
-                        if *self.peek() == Tok::Comma {
-                            self.bump();
-                        }
-                    }
-                    self.eat(&Tok::RParen)?;
+                    let (pos, named) = self.parse_args()?;
                     // `ClassName(args)` (no member/index in front) is a Dart
                     // instantiation, not a plain call.
                     e = match e {
                         Expr::Ident(name) if self.class_names.contains(&name) => {
-                            Expr::New(name, args)
+                            Expr::New(name, pos, named)
                         }
-                        callee => Expr::Call(Box::new(callee), args),
+                        callee => Expr::Call(Box::new(callee), pos, named),
                     };
                 }
                 Tok::LBracket => {
@@ -1063,16 +1102,8 @@ impl Parser {
             Tok::Kw(k) if k == "new" => {
                 // Optional `new` keyword: `new ClassName(args)`.
                 let name = self.ident()?;
-                self.eat(&Tok::LParen)?;
-                let mut args = Vec::new();
-                while *self.peek() != Tok::RParen {
-                    args.push(self.parse_expr()?);
-                    if *self.peek() == Tok::Comma {
-                        self.bump();
-                    }
-                }
-                self.eat(&Tok::RParen)?;
-                Ok(Expr::New(name, args))
+                let (pos, named) = self.parse_args()?;
+                Ok(Expr::New(name, pos, named))
             }
             Tok::Ident(s) => Ok(Expr::Ident(s)),
             Tok::LParen => {
@@ -1210,10 +1241,8 @@ impl Emitter {
                 own_methods.insert(c.name.clone(), c.methods.iter().map(|m| m.name.clone()).collect());
                 // `this.x` params are also fields.
                 if let Some(set) = own_fields.get_mut(&c.name) {
-                    for p in &c.ctor_params {
-                        if p.is_this {
-                            set.insert(p.name.clone());
-                        }
+                    for p in c.ctor_params.all_this_params() {
+                        set.insert(p.name.clone());
                     }
                 }
                 supers.insert(c.name.clone(), c.superclass.clone());
@@ -1258,6 +1287,67 @@ impl Emitter {
         self.locals.iter().any(|s| s.contains(name))
     }
 
+    /// The JS signature names for a param list: required + optional positional,
+    /// plus one trailing options object when there are named params.
+    fn param_sig(&self, pl: &ParamList) -> Vec<String> {
+        let mut names: Vec<String> = pl
+            .positional
+            .iter()
+            .chain(pl.optional_pos.iter())
+            .map(|p| p.name.clone())
+            .collect();
+        if !pl.named.is_empty() {
+            names.push(NAMED_ARG.to_string());
+        }
+        names
+    }
+
+    /// Declare all parameter names (and the options object) as locals so bare
+    /// references inside the body don't resolve to `this.field`.
+    fn declare_params(&mut self, pl: &ParamList) {
+        for p in pl.positional.iter().chain(pl.optional_pos.iter()).chain(pl.named.iter()) {
+            let n = p.name.clone();
+            self.declare(&n);
+        }
+        if !pl.named.is_empty() {
+            self.declare(NAMED_ARG);
+        }
+    }
+
+    /// Emit the prologue that fills optional-positional defaults and destructures
+    /// named params out of the options object (with defaults).
+    fn emit_param_prologue(&mut self, pl: &ParamList, depth: usize) {
+        for p in &pl.optional_pos {
+            if let Some(d) = &p.default {
+                let dv = self.emit_expr(d);
+                self.indent(depth);
+                self.out.push_str(&format!("if ({} == null) {{ {} = {}; }}\n", p.name, p.name, dv));
+            }
+        }
+        for p in &pl.named {
+            self.indent(depth);
+            self.out.push_str(&format!(
+                "var {n} = (({na} != null) ? {na}.{n} : null);\n",
+                n = p.name,
+                na = NAMED_ARG
+            ));
+            if let Some(d) = &p.default {
+                let dv = self.emit_expr(d);
+                self.indent(depth);
+                self.out.push_str(&format!("if ({} == null) {{ {} = {}; }}\n", p.name, p.name, dv));
+            }
+        }
+    }
+
+    /// Emit a named-argument options object literal: `{ "k": v, ... }`.
+    fn emit_named_object(&mut self, named: &[(String, Expr)]) -> String {
+        let pairs: Vec<String> = named
+            .iter()
+            .map(|(k, e)| format!("{}: {}", json_string(k), self.emit_expr(e)))
+            .collect();
+        format!("{{{}}}", pairs.join(", "))
+    }
+
     fn indent(&mut self, n: usize) {
         for _ in 0..n {
             self.out.push_str("  ");
@@ -1273,11 +1363,11 @@ impl Emitter {
                     if name == "main" {
                         has_main = true;
                     }
-                    self.out.push_str(&format!("function {}({}) {{\n", name, params.join(", ")));
+                    let sig = self.param_sig(params);
+                    self.out.push_str(&format!("function {}({}) {{\n", name, sig.join(", ")));
                     self.push_scope();
-                    for p in params {
-                        self.declare(p);
-                    }
+                    self.declare_params(params);
+                    self.emit_param_prologue(params, 1);
                     self.emit_stmts(body, 1);
                     self.pop_scope();
                     self.out.push_str("}\n");
@@ -1306,29 +1396,30 @@ impl Emitter {
         // Always emit a constructor so every instance is tagged with its class
         // name (used by the reified `is`/`as` checks host-side).
         {
-            let sig: Vec<String> = c.ctor_params.iter().map(|p| p.name.clone()).collect();
+            let sig = self.param_sig(&c.ctor_params);
             self.out.push_str(&format!("  constructor({}) {{\n", sig.join(", ")));
             self.push_scope();
-            for p in &c.ctor_params {
-                self.declare(&p.name);
-            }
+            self.declare_params(&c.ctor_params);
             if c.calls_super {
                 self.out.push_str("    super();\n");
             }
             // Reified-type tag: most-derived ctor wins (runs last).
             self.out.push_str(&format!("    this.__class = {};\n", json_string(&c.name)));
-            // Field initializers run first; an initializing formal (`this.x`)
-            // then wins, matching Dart's initialization order.
+            // Destructure named / fill optional-positional params first, so the
+            // `this.x` assignments below can read their locals.
+            self.emit_param_prologue(&c.ctor_params, 2);
+            // Field initializers, then initializing formals (`this.x`) win —
+            // matching Dart's initialization order.
             for (fname, init) in &c.fields {
                 if let Some(e) = init {
                     let v = self.emit_expr(e);
                     self.out.push_str(&format!("    this.{fname} = {v};\n"));
                 }
             }
-            for p in &c.ctor_params {
-                if p.is_this {
-                    self.out.push_str(&format!("    this.{} = {};\n", p.name, p.name));
-                }
+            let this_params: Vec<String> =
+                c.ctor_params.all_this_params().map(|p| p.name.clone()).collect();
+            for name in this_params {
+                self.out.push_str(&format!("    this.{name} = {name};\n"));
             }
             self.emit_stmts(&c.ctor_body, 2);
             self.pop_scope();
@@ -1336,11 +1427,11 @@ impl Emitter {
         }
 
         for m in &c.methods {
-            self.out.push_str(&format!("  {}({}) {{\n", m.name, m.params.join(", ")));
+            let sig = self.param_sig(&m.params);
+            self.out.push_str(&format!("  {}({}) {{\n", m.name, sig.join(", ")));
             self.push_scope();
-            for p in &m.params {
-                self.declare(p);
-            }
+            self.declare_params(&m.params);
+            self.emit_param_prologue(&m.params, 2);
             self.emit_stmts(&m.body, 2);
             self.pop_scope();
             self.out.push_str("  }\n");
@@ -1476,22 +1567,25 @@ impl Emitter {
             }
             Expr::Index(a, i) => format!("{}[{}]", self.emit_expr(a), self.emit_expr(i)),
             Expr::Member(obj, name) => format!("{}.{}", self.emit_expr(obj), name),
-            Expr::New(name, args) => {
-                let a: Vec<String> = args.iter().map(|x| self.emit_expr(x)).collect();
+            Expr::New(name, pos, named) => {
+                let mut a: Vec<String> = pos.iter().map(|x| self.emit_expr(x)).collect();
+                if !named.is_empty() {
+                    a.push(self.emit_named_object(named));
+                }
                 format!("new {}({})", name, a.join(", "))
             }
             Expr::Closure(params, body) => {
                 // Emit a JS function expression; params are locals in the body so
                 // bare field refs still resolve correctly around the closure.
+                let sig = self.param_sig(params);
                 let saved = std::mem::take(&mut self.out);
                 self.push_scope();
-                for p in params {
-                    self.declare(p);
-                }
+                self.declare_params(params);
+                self.emit_param_prologue(params, 1);
                 self.emit_stmts(body, 1);
                 let body_str = std::mem::replace(&mut self.out, saved);
                 self.pop_scope();
-                format!("function({}) {{\n{}}}", params.join(", "), body_str)
+                format!("function({}) {{\n{}}}", sig.join(", "), body_str)
             }
             Expr::Is(x, ty) => {
                 format!("askHost(\"dart:core/isType\", [{}, {}])", self.emit_expr(x), json_string(ty))
@@ -1499,20 +1593,26 @@ impl Emitter {
             Expr::As(x, ty) => {
                 format!("askHost(\"dart:core/asType\", [{}, {}])", self.emit_expr(x), json_string(ty))
             }
-            Expr::Call(callee, args) => {
+            Expr::Call(callee, pos, named) => {
                 if let Expr::Ident(name) = &**callee {
-                    if name == "print" && args.len() == 1 {
-                        let a0 = self.emit_expr(&args[0]);
+                    if name == "print" && pos.len() == 1 && named.is_empty() {
+                        let a0 = self.emit_expr(&pos[0]);
                         return format!("askHost(\"log\", [{a0}])");
                     }
                     // Bare call to an own method inside a class -> this.method().
                     if self.in_class && !self.is_local(name) && self.methods.contains(name) {
-                        let a: Vec<String> = args.iter().map(|x| self.emit_expr(x)).collect();
+                        let mut a: Vec<String> = pos.iter().map(|x| self.emit_expr(x)).collect();
+                        if !named.is_empty() {
+                            a.push(self.emit_named_object(named));
+                        }
                         return format!("this.{}({})", name, a.join(", "));
                     }
                 }
                 let c = self.emit_expr(callee);
-                let a: Vec<String> = args.iter().map(|x| self.emit_expr(x)).collect();
+                let mut a: Vec<String> = pos.iter().map(|x| self.emit_expr(x)).collect();
+                if !named.is_empty() {
+                    a.push(self.emit_named_object(named));
+                }
                 format!("{}({})", c, a.join(", "))
             }
         }
