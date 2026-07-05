@@ -82,18 +82,37 @@ Every `dart:*` call passes through both:
 | **P5** signed code-delivery — SHA-256/HMAC (KAT-verified), verify-before-load, downgrade guard, signed **manifest** with content-hash pinning | ✅ built, tested | `sha256.rs`, `bundle.rs` |
 | **P6** **widget layer** — `StatelessWidget`/`StatefulWidget`/`State`, `runApp`, `Container`/`Column`/`Row`/`Center`/`Text`/`GestureDetector`/… ; build → layout → paint → tap → `setState` → repaint | ✅ built, tested | `widgets.rs` |
 | **P6** front-end deepening — `for-in` loops + hex int literals (`0xFF2196F3`) | ✅ built, tested | `dart_frontend.rs` |
+| **P7** **`flutter.dart` library** — a large, idiomatic Flutter widget/painting library (`Widget`/`State`/`Color`/`Colors`/`EdgeInsets`/`Alignment`/`BoxConstraints`/enums/`RenderFlex`-style layout/`MaterialApp`/`Scaffold`/`AppBar`/`Card`/…), `import`ed by an app | ✅ built, tested | `flutter/flutter.dart` |
+| **P7** front-end idioms — annotations, `abstract`, `const`, `enum`, `static` members + named ctors, **getters**, `??`, `void`-arrow bodies | ✅ built, tested | `dart_frontend.rs` |
 | native + `wasm32` compilation | ✅ verified | — |
 
-**183 tests pass** (native) and the whole stack builds for `wasm32`. The
+**190 tests pass** (native) and the whole stack builds for `wasm32`. The
 integration tests run **real guest programs on the real VM** end-to-end,
 including: Dart classes with inheritance, reified `is`/`as`, the async ordering
 guarantee, isolate message passing, a capability denial, a resource-limit
 cutoff, the pointer-event + frame-render loop with retained diffing, the
-signed-bundle accept/tamper-reject path, and — new — a **real Flutter-style
-widget app** (`StatefulWidget` counter with a `GestureDetector`) that renders,
-takes a tap, mutates `State` via `setState`, and repaints with the new value.
-That widget app also runs in a **headless browser and rasterizes to real
-pixels** (`web-demo/widgets_test.mjs`).
+signed-bundle accept/tamper-reject path, a **real Flutter-style widget app**
+that renders / taps / `setState`s / repaints, and — new — a **realistic app
+written against the imported `flutter.dart` library** (`MaterialApp` → `Scaffold`
+→ `AppBar` + a `StatefulWidget` counter card with `+`/`-` `ElevatedButton`s,
+`Card`, `Row`/`Column`, `Expanded`, and stat chips) whose buttons drive
+`setState`. Both apps also run in a **headless browser and rasterize to real
+pixels** (`web-demo/widgets_test.mjs`, `web-demo/flutter_test.mjs`).
+
+The `flutter.dart` library is imported exactly as in Flutter:
+
+```dart
+import 'flutter.dart';
+class MyApp extends StatelessWidget {
+  Widget build(BuildContext context) => MaterialApp(
+    home: Scaffold(
+      appBar: AppBar(title: Text('Hi', style: TextStyle(color: Colors.white))),
+      body: Center(child: Text('Hello', style: TextStyle(fontSize: 32.0))),
+    ),
+  );
+}
+void main() => runApp(MyApp());
+```
 
 > A finding that de-risks the language work: Elpian's value model **already
 > represents integers and floats with separate tags** (`typ` 1/2/3 = i16/i32/i64,
@@ -139,16 +158,35 @@ each frame it rebuilds the tree from the root, lays it out under constraints,
 and paints it into the `dart:ui` scene; taps are hit-tested to `GestureDetector`s
 and `setState` requests the next frame. `State` persists across frames (matched
 by build order). The `engine/.../elpian` layer exposes `LoadWidgetApp` /
-`elpian_init_widgets` to run such a bundle. *Deepen:* `Expanded`/`Flexible` flex,
-`Stack`/`Positioned`, `EdgeInsets`, keyed reconciliation, and engine-provided
-text measurement (so `Text` size is exact, not estimated).
+`elpian_init_widgets` to run such a bundle.
+
+**Phase 7 — the `flutter.dart` library ✅.** A large, **idiomatic** Flutter
+widget/painting library authored as ordinary Dart in
+[`flutter/flutter.dart`](elpian-dart/flutter/flutter.dart) and modelled on the
+real framework's public API — `Key`, `Widget`/`StatelessWidget`/`StatefulWidget`/
+`State`, `BuildContext`; the painting value types `Color`/`Colors`/`Offset`/
+`Size`/`Rect`/`EdgeInsets`/`Alignment`/`BorderRadius`/`BoxDecoration`/`TextStyle`/
+`BoxConstraints`; the enums `Axis`/`MainAxisAlignment`/`CrossAxisAlignment`/
+`MainAxisSize`/`TextAlign`/`FontWeight`; a real two-phase `layout(constraints)`/
+`paint(offset)` protocol with a `RenderFlex`-style flex algorithm; the widgets
+`Container`/`DecoratedBox`/`ColoredBox`/`Padding`/`Center`/`Align`/`Column`/`Row`/
+`Stack`/`Positioned`/`Expanded`/`Flexible`/`Spacer`/`SizedBox`/`Text`/`Icon`/
+`Divider`/`GestureDetector`; and the Material shells `MaterialApp`/`Scaffold`/
+`AppBar`/`Card`/`ElevatedButton`/`TextButton`. An app imports it (`import
+'flutter.dart';`) and runs on the VM (`LoadFlutterApp` / `elpian_init_flutter`).
+Landing it drove the front-end
+to accept the idioms the real framework is written in (annotations, `abstract`,
+`const`, `enum`, `static` members + named constructors, getters, `??`). *Deepen:*
+`Stack` fit/clipping, `ListView`/scrolling, `Theme`/`InheritedWidget`, keyed
+reconciliation, animations, and engine-provided text metrics.
 
 ## Honest scope statement
 
-Phases 1–6 are real, compile (native + wasm32), and are covered by 183 passing
-tests including end-to-end runs on the actual VM — now including a real
-widget-code app that renders, takes a tap, and repaints from mutated `State`,
-verified both in the Rust suite and, rasterized to pixels, in a headless browser.
+Phases 1–7 are real, compile (native + wasm32), and are covered by 190 passing
+tests including end-to-end runs on the actual VM — now including a realistic app
+written against the imported `flutter.dart` library that renders a full Material
+screen, takes taps, and repaints from mutated `State`, verified both in the Rust
+suite and, rasterized to pixels, in a headless browser.
 This is a working **foundation and vertical slice through every layer** of the
 architecture — not a complete Dart VM or a drop-in for the unmodified Flutter
 framework. The two things that remain genuinely large are (a) breadth — filling

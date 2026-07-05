@@ -468,3 +468,45 @@ class Scaffold extends StatelessWidget {
 pub fn compose(app_source: &str) -> String {
     format!("{WIDGET_PRELUDE}\n{app_source}")
 }
+
+/// The full, idiomatic Flutter widget library (`flutter/flutter.dart`), authored
+/// as ordinary Dart and embedded at build time. This is the library an app
+/// `import`s; it defines the widget classes, painting value types, layout
+/// protocol, and the engine binding. Compiled through the same front-end as the
+/// app itself.
+pub const FLUTTER_LIB: &str = include_str!("../flutter/flutter.dart");
+
+/// Remove Dart library directives (`import`/`export`/`library`/`part`) from a
+/// source file. The Elpian front-end has no module system: an app's
+/// `import 'flutter.dart';` is satisfied by concatenating the library ahead of
+/// the app (see [`compose_flutter`]), so the directive line itself is dropped.
+pub fn strip_directives(src: &str) -> String {
+    src.lines()
+        .map(|line| {
+            let t = line.trim_start();
+            if t.starts_with("import ")
+                || t.starts_with("export ")
+                || t.starts_with("part ")
+                || t == "library;"
+                || t.starts_with("library ")
+            {
+                "" // keep line numbering stable
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Compose a full program from an app that `import`s `flutter.dart`: the
+/// [`FLUTTER_LIB`] library is placed ahead of the app (both with their library
+/// directives stripped), so the whole thing — library + app — compiles as one
+/// unit through the Dart → AST → bytecode → VM pipeline.
+pub fn compose_flutter(app_source: &str) -> String {
+    format!(
+        "{}\n{}",
+        strip_directives(FLUTTER_LIB),
+        strip_directives(app_source)
+    )
+}

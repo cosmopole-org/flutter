@@ -63,6 +63,19 @@ new state.
 node widgets_test.mjs        # taps the widget button, asserts the bar tracks state -> WIDGETS E2E PASSED
 ```
 
+### Full `flutter.dart` app variant
+
+`flutter.html` + `flutter_test.mjs` run [`demo_app.dart`](../elpian-dart/flutter/demo_app.dart)
+— a realistic app that `import 'flutter.dart'` (the full idiomatic widget
+library) and builds a `MaterialApp` → `Scaffold` → `AppBar` with a counter
+`Card`, `+`/`-` `ElevatedButton`s, a progress bar, and stat chips. The library
+is baked into the wasm and prepended by the `elpian_init_flutter` export; real
+clicks drive `setState` and the Material UI repaints.
+
+```sh
+node flutter_test.mjs        # taps +/-, asserts the counter/derived stats update -> FLUTTER APP E2E PASSED
+```
+
 ## Honest scope
 
 This is the **Elpian renderer**, not Flutter's CanvasKit/WebGL engine. It proves

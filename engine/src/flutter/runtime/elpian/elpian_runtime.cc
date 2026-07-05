@@ -41,6 +41,18 @@ bool ElpianRuntime::LoadWidgetApp(const std::string& source) {
   return loaded_;
 }
 
+bool ElpianRuntime::LoadFlutterApp(const std::string& source) {
+  uint8_t* buf = elpian_alloc(source.size());
+  std::memcpy(buf, source.data(), source.size());
+  const int32_t rc = elpian_init_flutter(buf, source.size());
+  elpian_free(buf, source.size());
+  loaded_ = rc == 0;
+  if (!loaded_) {
+    FML_LOG(ERROR) << "ElpianRuntime: flutter.dart app failed to compile/load";
+  }
+  return loaded_;
+}
+
 void ElpianRuntime::DispatchPointer(double x, double y, bool down) {
   if (loaded_) {
     elpian_pointer(x, y, down ? 1 : 0);

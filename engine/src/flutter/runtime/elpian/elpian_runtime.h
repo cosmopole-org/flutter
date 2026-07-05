@@ -40,6 +40,11 @@ class ElpianRuntime {
   // Returns false on compile/load failure.
   bool LoadWidgetApp(const std::string& source);
 
+  // Compile + run an app authored against the full flutter.dart library
+  // (`import 'flutter.dart';`) — the idiomatic widget/painting library, which is
+  // concatenated ahead of the app by the VM layer. Returns false on failure.
+  bool LoadFlutterApp(const std::string& source);
+
   // Deliver a pointer event to the guest's `onPointerEvent` handler.
   void DispatchPointer(double x, double y, bool down);
 

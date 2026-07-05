@@ -148,6 +148,22 @@ impl DartRuntime {
         Self::from_dart(machine_id, &composed, caps, meter)
     }
 
+    /// Build a runtime from a **Flutter app that imports `flutter.dart`** — the
+    /// full idiomatic widget library ([`crate::widgets::FLUTTER_LIB`]). The
+    /// library is concatenated ahead of the app (import directives stripped) and
+    /// the whole program takes the same Dart → AST → bytecode → VM path. Drive it
+    /// with [`render_frame`](Self::render_frame) and
+    /// [`dispatch_pointer`](Self::dispatch_pointer).
+    pub fn from_flutter_app(
+        machine_id: impl Into<String>,
+        app_source: &str,
+        caps: DartCapabilitySet,
+        meter: ResourceMeter,
+    ) -> Result<Self, DartError> {
+        let composed = crate::widgets::compose_flutter(app_source);
+        Self::from_dart(machine_id, &composed, caps, meter)
+    }
+
     /// Whether the guest has requested a repaint since the last
     /// [`clear_needs_frame`](Self::clear_needs_frame) (i.e. a `setState` ran).
     /// A host frame scheduler polls this to coalesce repaints.

@@ -21,6 +21,9 @@
 //     a *Flutter-style widget app* (StatelessWidget/StatefulWidget + build() +
 //     runApp): the widget framework is prepended, so onDrawFrame builds, lays
 //     out, and paints the widget tree, and onPointerEvent hit-tests taps.
+//   * `elpian_init_flutter(ptr, len)` is the same, but the bundle is authored
+//     against the full `flutter.dart` library (`import 'flutter.dart';`) — the
+//     idiomatic widget/painting library, concatenated ahead of the app.
 //   * `elpian_pointer(x, y, down)` delivers a pointer event to the guest.
 //   * `elpian_frame()` renders one frame and stores the scene-tree JSON,
 //     returning its byte length; read it at `elpian_result_ptr()`.
@@ -34,6 +37,8 @@ void elpian_free(uint8_t* ptr, size_t len);
 int32_t elpian_init(const uint8_t* ptr, size_t len);
 // As elpian_init, but the bundle is a widget app (runApp + widget classes).
 int32_t elpian_init_widgets(const uint8_t* ptr, size_t len);
+// As elpian_init, but the bundle imports the full flutter.dart library.
+int32_t elpian_init_flutter(const uint8_t* ptr, size_t len);
 void elpian_pointer(double x, double y, int32_t down);
 size_t elpian_frame();
 const uint8_t* elpian_result_ptr();
