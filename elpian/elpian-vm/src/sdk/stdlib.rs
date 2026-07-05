@@ -989,6 +989,149 @@ pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
             let i = as_int(&args[1])? as usize;
             Ok(vi64(s.encode_utf16().nth(i).map(|c| c as i64).unwrap_or(0)))
         }
+        "String.padRight" => {
+            at_least(name, args, 2)?;
+            let s = args[0].as_string();
+            let width = as_int(&args[1])? as usize;
+            let pad = args.get(2).map(|v| v.as_string()).unwrap_or_else(|| " ".into());
+            let padc = pad.chars().next().unwrap_or(' ');
+            let deficit = width.saturating_sub(s.chars().count());
+            Ok(vstr(format!("{}{}", s, padc.to_string().repeat(deficit))))
+        }
+        "String.padLeft" => {
+            at_least(name, args, 2)?;
+            let s = args[0].as_string();
+            let width = as_int(&args[1])? as usize;
+            let pad = args.get(2).map(|v| v.as_string()).unwrap_or_else(|| " ".into());
+            let padc = pad.chars().next().unwrap_or(' ');
+            let deficit = width.saturating_sub(s.chars().count());
+            Ok(vstr(format!("{}{}", padc.to_string().repeat(deficit), s)))
+        }
+        "String.replaceFirst" => {
+            at_least(name, args, 3)?;
+            Ok(vstr(args[0].as_string().replacen(&args[1].as_string(), &args[2].as_string(), 1)))
+        }
+        "String.trimLeft" => Ok(vstr(args[0].as_string().trim_start().to_string())),
+        "String.trimRight" => Ok(vstr(args[0].as_string().trim_end().to_string())),
+
+        // ---- num methods (receiver is a number) ----------------------------
+        "Num.toInt" => Ok(vi64(as_num(&args[0])?.trunc() as i64)),
+        "Num.toDouble" => Ok(vf64(as_num(&args[0])?)),
+        "Num.abs" => {
+            if matches!(args[0].typ, 1 | 2 | 3) {
+                Ok(vi64(as_int(&args[0])?.abs()))
+            } else {
+                Ok(vf64(as_num(&args[0])?.abs()))
+            }
+        }
+        "Num.floor" => Ok(vi64(as_num(&args[0])?.floor() as i64)),
+        "Num.ceil" => Ok(vi64(as_num(&args[0])?.ceil() as i64)),
+        "Num.round" => Ok(vi64(as_num(&args[0])?.round() as i64)),
+        "Num.isNaN" => Ok(vbool(as_num(&args[0])?.is_nan())),
+        "Num.isNegative" => Ok(vbool(as_num(&args[0])? < 0.0)),
+        "Num.toString" => {
+            if matches!(args[0].typ, 1 | 2 | 3) {
+                Ok(vstr(as_int(&args[0])?.to_string()))
+            } else {
+                let d = as_num(&args[0])?;
+                Ok(vstr(if d.fract() == 0.0 { format!("{d:.1}") } else { format!("{d}") }))
+            }
+        }
+        "Num.toStringAsFixed" => {
+            at_least(name, args, 2)?;
+            let d = as_num(&args[0])?;
+            let k = as_int(&args[1])? as usize;
+            Ok(vstr(format!("{d:.*}", k)))
+        }
+        "Num.clamp" => {
+            at_least(name, args, 3)?;
+            let (x, lo, hi) = (as_num(&args[0])?, as_num(&args[1])?, as_num(&args[2])?);
+            Ok(num_result(x.max(lo).min(hi)))
+        }
+
+        // ---- more List methods --------------------------------------------
+        "List.addAll" => {
+            at_least(name, args, 2)?;
+            let other = args[1].as_array().borrow().data.clone();
+            args[0].as_array().borrow_mut().data.extend(other);
+            Ok(Val::new(0, Payload::Null))
+        }
+        "List.removeAt" => {
+            at_least(name, args, 2)?;
+            let i = as_int(&args[1])? as usize;
+            let a = args[0].as_array();
+            let mut b = a.borrow_mut();
+            if i < b.data.len() {
+                Ok(b.data.remove(i))
+            } else {
+                Err("RangeError: removeAt out of range".into())
+            }
+        }
+        "List.insert" => {
+            at_least(name, args, 3)?;
+            let i = as_int(&args[1])? as usize;
+            let a = args[0].as_array();
+            let mut b = a.borrow_mut();
+            let idx = i.min(b.data.len());
+            b.data.insert(idx, args[2].clone());
+            Ok(Val::new(0, Payload::Null))
+        }
+        "List.clear" => {
+            args[0].as_array().borrow_mut().data.clear();
+            Ok(Val::new(0, Payload::Null))
+        }
+        "List.reversed" => {
+            let mut v = args[0].as_array().borrow().data.clone();
+            v.reverse();
+            Ok(varr(v))
+        }
+
+        // ---- Map methods (receiver is a plain object) ----------------------
+        "Map.keys" => {
+            let o = expect_object(name, &args[0])?;
+            let b = o.borrow();
+            let keys: Vec<Val> = b.data.data.keys().map(|k| vstr(k.clone())).collect();
+            Ok(varr(keys))
+        }
+        "Map.values" => {
+            let o = expect_object(name, &args[0])?;
+            let b = o.borrow();
+            let vals: Vec<Val> = b.data.data.values().cloned().collect();
+            Ok(varr(vals))
+        }
+        "Map.containsKey" => {
+            at_least(name, args, 2)?;
+            let o = expect_object(name, &args[0])?;
+            let has = o.borrow().data.data.contains_key(&args[1].as_string());
+            Ok(vbool(has))
+        }
+        "Map.remove" => {
+            at_least(name, args, 2)?;
+            let o = expect_object(name, &args[0])?;
+            let removed = o.borrow_mut().data.data.remove(&args[1].as_string());
+            Ok(removed.unwrap_or_else(|| Val::new(0, Payload::Null)))
+        }
+        "Map.putIfAbsent" => {
+            at_least(name, args, 3)?;
+            let o = expect_object(name, &args[0])?;
+            let key = args[1].as_string();
+            let mut b = o.borrow_mut();
+            if !b.data.data.contains_key(&key) {
+                b.data.data.insert(key.clone(), args[2].clone());
+            }
+            let out = b.data.data.get(&key).cloned().unwrap_or_else(|| Val::new(0, Payload::Null));
+            Ok(out)
+        }
+        "Map.isEmpty" => {
+            let o = expect_object(name, &args[0])?;
+            let empty = o.borrow().data.data.is_empty();
+            Ok(vbool(empty))
+        }
+        "Map.isNotEmpty" => {
+            let o = expect_object(name, &args[0])?;
+            let empty = o.borrow().data.data.is_empty();
+            Ok(vbool(!empty))
+        }
 
         _ => Err(format!("unknown builtin '{name}'")),
     }

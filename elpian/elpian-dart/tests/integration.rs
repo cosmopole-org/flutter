@@ -646,3 +646,53 @@ fn dart_async_await() {
     assert!(out.contains(&serde_json::json!(30)), "sumTwo -> 30, got {out:?}");
     assert!(out.contains(&serde_json::json!("total=30")), "label -> total=30, got {out:?}");
 }
+
+/// VM conformance: broadened dart:core surface — num methods/getters, more
+/// List methods, Map literals + methods/getters, more String methods.
+#[test]
+fn dart_core_surface() {
+    let dart = r#"
+        void main() {
+            askHost("test.emit", [(3.7).toInt()]);
+            askHost("test.emit", [(-5).abs()]);
+            askHost("test.emit", [(3.14159).toStringAsFixed(2)]);
+            askHost("test.emit", [(9).clamp(0, 5)]);
+            var xs = [3, 1, 2];
+            xs.addAll([4]);
+            xs.insert(0, 0);
+            askHost("test.emit", [xs.length]);
+            askHost("test.emit", [xs.first]);
+            askHost("test.emit", [xs.reversed]);
+            var m = {"a": 1, "b": 2};
+            m["c"] = 3;
+            askHost("test.emit", [m.length]);
+            askHost("test.emit", [m.containsKey("b")]);
+            askHost("test.emit", [m.keys.length]);
+            askHost("test.emit", ["hi".padRight(5, ".")]);
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "core_surface_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    assert_eq!(
+        rt.emitted(),
+        &[
+            serde_json::json!(3),          // 3.7.toInt
+            serde_json::json!(5),          // (-5).abs
+            serde_json::json!("3.14"),     // toStringAsFixed
+            serde_json::json!(5),          // clamp(9 -> 0..5)
+            serde_json::json!(5),          // length after addAll+insert
+            serde_json::json!(0),          // first (inserted 0)
+            serde_json::json!([4, 2, 1, 3, 0]), // reversed
+            serde_json::json!(3),          // map length
+            serde_json::json!(true),       // containsKey
+            serde_json::json!(3),          // keys.length
+            serde_json::json!("hi..."),    // padRight
+        ]
+    );
+}

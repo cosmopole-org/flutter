@@ -794,8 +794,52 @@ impl Operation for Arithmetic {
 fn is_list_method(key: &str) -> bool {
     matches!(
         key,
-        "add" | "contains" | "indexOf" | "removeLast" | "first" | "last" | "sublist" | "join"
+        "add" | "contains"
+            | "indexOf"
+            | "removeLast"
+            | "sublist"
+            | "join"
+            | "addAll"
+            | "removeAt"
+            | "insert"
+            | "clear"
     )
+}
+
+/// `List` getters (no parens) — dispatched eagerly to their value.
+fn is_list_getter(key: &str) -> bool {
+    matches!(key, "first" | "last" | "reversed")
+}
+
+/// Core `num`/`int`/`double` method names (receiver is a number, typ 1-5).
+fn is_num_method(key: &str) -> bool {
+    matches!(
+        key,
+        "toInt"
+            | "toDouble"
+            | "abs"
+            | "floor"
+            | "ceil"
+            | "round"
+            | "toString"
+            | "toStringAsFixed"
+            | "clamp"
+    )
+}
+
+/// `num` getters (no parens).
+fn is_num_getter(key: &str) -> bool {
+    matches!(key, "isNaN" | "isNegative")
+}
+
+/// Plain-`Map` method names (only for objects without a `__class` tag).
+fn is_map_method(key: &str) -> bool {
+    matches!(key, "containsKey" | "remove" | "putIfAbsent")
+}
+
+/// Plain-`Map` getters (no parens).
+fn is_map_getter(key: &str) -> bool {
+    matches!(key, "keys" | "values" | "isEmpty" | "isNotEmpty")
 }
 
 /// Higher-order `List` methods implemented as prelude functions (they take a
@@ -823,6 +867,11 @@ fn is_string_method(key: &str) -> bool {
             | "endsWith"
             | "replaceAll"
             | "codeUnitAt"
+            | "padRight"
+            | "padLeft"
+            | "replaceFirst"
+            | "trimLeft"
+            | "trimRight"
     )
 }
 
@@ -4826,6 +4875,33 @@ impl Executor {
                                     typ: 253,
                                     data: Payload::from(Rc::new(RefCell::new(holder))),
                                 });
+                            } else if matches!(indexed.typ, 1 | 2 | 3 | 4 | 5)
+                                && is_num_getter(&__key)
+                            {
+                                // Numeric getter (e.g. `x.isNaN`): dispatched eagerly.
+                                main_reg = Some(
+                                    stdlib::invoke(&format!("Num.{__key}"), &[indexed.clone()])
+                                        .unwrap_or_else(|_| self.check_int_range(0)),
+                                );
+                            } else if matches!(indexed.typ, 1 | 2 | 3 | 4 | 5)
+                                && is_num_method(&__key)
+                            {
+                                // Numeric method on int/double: bound native.
+                                let name_val = Val {
+                                    typ: 7,
+                                    data: Payload::from(format!("Num.{__key}")),
+                                };
+                                let holder = Array::new(vec![indexed.clone(), name_val]);
+                                main_reg = Some(Val {
+                                    typ: 253,
+                                    data: Payload::from(Rc::new(RefCell::new(holder))),
+                                });
+                            } else if indexed.typ == 9 && is_list_getter(&__key) {
+                                // List getter (`xs.first`/`.last`/`.reversed`).
+                                main_reg = Some(
+                                    stdlib::invoke(&format!("List.{__key}"), &[indexed.clone()])
+                                        .unwrap_or_else(|_| self.check_int_range(0)),
+                                );
                             } else if indexed.typ == 9 && is_list_prelude_method(&__key) {
                                 // Higher-order method: bind the prelude function
                                 // `__List_<name>` to the receiver (via `this`), so
@@ -4849,11 +4925,43 @@ impl Executor {
                                     // receiver, so `obj.method(args)` runs with `this`.
                                     main_reg = Some(bound);
                                 } else {
-                                    // An absent key/field reads as null (which the VM
-                                    // models as integer 0), matching Dart's
-                                    // `map[absent] == null` — not the typed-undefined
-                                    // sentinel, so `x == null` guards work.
-                                    main_reg = Some(self.check_int_range(0));
+                                    // A plain Map (no `__class` tag) exposes Map
+                                    // members; class instances do not.
+                                    let is_plain_map = indexed
+                                        .as_object()
+                                        .borrow()
+                                        .data
+                                        .data
+                                        .get("__class")
+                                        .is_none();
+                                    if is_plain_map && key == "length" {
+                                        let n = indexed.as_object().borrow().data.data.len();
+                                        main_reg = Some(self.check_int_range(n as i64));
+                                    } else if is_plain_map && is_map_getter(&key) {
+                                        // Map getter (`m.keys`/`.values`/`.isEmpty`).
+                                        main_reg = Some(
+                                            stdlib::invoke(
+                                                &format!("Map.{key}"),
+                                                &[indexed.clone()],
+                                            )
+                                            .unwrap_or_else(|_| self.check_int_range(0)),
+                                        );
+                                    } else if is_plain_map && is_map_method(&key) {
+                                        let name_val = Val {
+                                            typ: 7,
+                                            data: Payload::from(format!("Map.{key}")),
+                                        };
+                                        let holder =
+                                            Array::new(vec![indexed.clone(), name_val]);
+                                        main_reg = Some(Val {
+                                            typ: 253,
+                                            data: Payload::from(Rc::new(RefCell::new(holder))),
+                                        });
+                                    } else {
+                                        // An absent key/field reads as null (integer 0),
+                                        // matching Dart's `map[absent] == null`.
+                                        main_reg = Some(self.check_int_range(0));
+                                    }
                                 }
                             } else {
                                 eprintln!(

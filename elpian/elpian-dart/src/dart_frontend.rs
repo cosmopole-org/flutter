@@ -414,6 +414,9 @@ enum Expr {
     Closure(ParamList, Vec<Stmt>),
     /// `await expr` inside an `async` function.
     Await(Box<Expr>),
+    /// A map literal `{k: v, ...}` (entries with values) or a set literal
+    /// `{a, b, ...}` (entries without values, lowered to a list).
+    MapOrSet(Vec<(Expr, Option<Expr>)>),
 }
 
 #[derive(Debug, Clone)]
@@ -1196,6 +1199,25 @@ impl Parser {
                 self.eat(&Tok::RBracket)?;
                 Ok(Expr::List(elems))
             }
+            Tok::LBrace => {
+                // Map literal `{k: v}` or set literal `{a, b}` (empty `{}` is a Map).
+                let mut entries = Vec::new();
+                while *self.peek() != Tok::RBrace {
+                    let k = self.parse_expr()?;
+                    let v = if *self.peek() == Tok::Colon {
+                        self.bump();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    entries.push((k, v));
+                    if *self.peek() == Tok::Comma {
+                        self.bump();
+                    }
+                }
+                self.eat(&Tok::RBrace)?;
+                Ok(Expr::MapOrSet(entries))
+            }
             other => Err(format!("unexpected token in expression: {other:?}")),
         }
     }
@@ -1715,7 +1737,16 @@ impl Emitter {
                 format!("{} {} {}", self.emit_expr(a), op, self.emit_expr(b))
             }
             Expr::Index(a, i) => format!("{}[{}]", self.emit_expr(a), self.emit_expr(i)),
-            Expr::Member(obj, name) => format!("{}.{}", self.emit_expr(obj), name),
+            Expr::Member(obj, name) => {
+                let o = self.emit_expr(obj);
+                // A numeric-literal receiver needs parens: `7.clamp` would lex as
+                // the float `7.` followed by `clamp`.
+                if matches!(&**obj, Expr::Int(_) | Expr::Double(_)) {
+                    format!("({o}).{name}")
+                } else {
+                    format!("{o}.{name}")
+                }
+            }
             Expr::New(name, pos, named) => {
                 let mut a: Vec<String> = pos.iter().map(|x| self.emit_expr(x)).collect();
                 if !named.is_empty() {
@@ -1740,6 +1771,25 @@ impl Emitter {
             // suspend; surface the awaited future's wrapper so it at least
             // type-checks. Top-level awaits are handled by emit_async_seq.
             Expr::Await(e) => format!("__await({})", self.emit_expr(e)),
+            Expr::MapOrSet(entries) => {
+                let is_set = !entries.is_empty() && entries.iter().all(|(_, v)| v.is_none());
+                if is_set {
+                    // Set literal -> list (iteration works; set uniqueness is not
+                    // modelled).
+                    let items: Vec<String> = entries.iter().map(|(k, _)| self.emit_expr(k)).collect();
+                    format!("[{}]", items.join(", "))
+                } else {
+                    // Map literal -> object literal with the given keys.
+                    let pairs: Vec<String> = entries
+                        .iter()
+                        .map(|(k, v)| {
+                            let val = v.as_ref().map(|e| self.emit_expr(e)).unwrap_or_else(|| "null".into());
+                            format!("{}: {}", self.emit_expr(k), val)
+                        })
+                        .collect();
+                    format!("{{{}}}", pairs.join(", "))
+                }
+            }
             Expr::Is(x, ty) => {
                 format!("askHost(\"dart:core/isType\", [{}, {}])", self.emit_expr(x), json_string(ty))
             }
