@@ -1352,11 +1352,13 @@ impl Emitter {
             }
             Expr::Unary(op, x) => format!("({}{})", op, self.emit_expr(x)),
             Expr::Update(op, x, prefix) => {
+                // No wrapping parens: Elpian's JS parser accepts `i++` as a
+                // statement but rejects `(i++)`.
                 let v = self.emit_expr(x);
                 if *prefix {
-                    format!("({op}{v})")
+                    format!("{op}{v}")
                 } else {
-                    format!("({v}{op})")
+                    format!("{v}{op}")
                 }
             }
             Expr::Binary(op, a, b) => {

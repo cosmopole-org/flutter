@@ -4721,7 +4721,30 @@ impl Executor {
                         let index = regs[1].clone();
                         self.registers.pop();
                         if index.typ == 7 {
-                            if indexed.typ == 8 {
+                            let __key = index.as_string();
+                            // Dart core-type members on built-in List (typ 9) and
+                            // String (typ 7). These are properties (no call), so
+                            // they resolve directly here; this path previously
+                            // errored to null for non-objects.
+                            if indexed.typ == 9
+                                && matches!(__key.as_str(), "length" | "isEmpty" | "isNotEmpty")
+                            {
+                                let len = indexed.as_array().borrow().data.len();
+                                main_reg = Some(match __key.as_str() {
+                                    "length" => self.check_int_range(len as i64),
+                                    "isEmpty" => Val { typ: 6, data: Payload::from(len == 0) },
+                                    _ => Val { typ: 6, data: Payload::from(len != 0) },
+                                });
+                            } else if indexed.typ == 7
+                                && matches!(__key.as_str(), "length" | "isEmpty" | "isNotEmpty")
+                            {
+                                let len = indexed.as_string().chars().count();
+                                main_reg = Some(match __key.as_str() {
+                                    "length" => self.check_int_range(len as i64),
+                                    "isEmpty" => Val { typ: 6, data: Payload::from(len == 0) },
+                                    _ => Val { typ: 6, data: Payload::from(len != 0) },
+                                });
+                            } else if indexed.typ == 8 {
                                 let key = index.as_string();
                                 let own = indexed.as_object().borrow().data.data.get(&key).cloned();
                                 if let Some(o) = own {

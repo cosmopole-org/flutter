@@ -452,3 +452,32 @@ fn frame_diff_is_minimal() {
     assert_eq!(p1.len(), 1, "only the color should differ");
     assert_eq!(p1[0].value, Some(serde_json::json!(200)));
 }
+
+/// VM conformance: Dart core-type members (`List.length`, indexing, `String.length`)
+/// now resolve in the VM, so idiomatic Dart that iterates a list runs unchanged.
+#[test]
+fn dart_list_and_string_length() {
+    let dart = r#"
+        void main() {
+            var xs = [10, 20, 30, 40];
+            var total = 0;
+            for (int i = 0; i < xs.length; i++) { total = total + xs[i]; }
+            var name = "flutter";
+            askHost("test.emit", [total]);
+            askHost("test.emit", [name.length]);
+            askHost("test.emit", [xs.isEmpty]);
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "corelib_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    assert_eq!(
+        rt.emitted(),
+        &[serde_json::json!(100), serde_json::json!(7), serde_json::json!(false)]
+    );
+}
