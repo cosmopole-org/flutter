@@ -88,7 +88,7 @@ pub fn required_capability(library: &str) -> DartCapability {
         "io" => DartCapability::Io,
         "isolate" => DartCapability::Isolate,
         "ffi" => DartCapability::Ffi,
-        "core" | "async" | "math" => DartCapability::Environment,
+        "core" | "async" | "math" | "convert" => DartCapability::Environment,
         _ => DartCapability::Ffi,
     }
 }

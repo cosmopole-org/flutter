@@ -42,6 +42,7 @@
 pub mod async_loop;
 pub mod binding;
 pub mod bundle;
+pub mod convert;
 pub mod core;
 pub mod dart_frontend;
 pub mod dart_ui;

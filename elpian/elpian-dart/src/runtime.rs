@@ -288,6 +288,7 @@ impl DartRuntime {
             "typed_data" => self.typed_data.dispatch(method, args),
             "ui" => self.ui.dispatch(method, args),
             "core" | "math" => self.core.dispatch(library, method, args),
+            "convert" => crate::convert::dispatch(method, args),
             "async" => self.dispatch_async(method, args),
             other => Err(format!("unimplemented library dart:{other} (method {method})")),
         };

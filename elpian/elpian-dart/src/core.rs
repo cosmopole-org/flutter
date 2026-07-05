@@ -125,6 +125,46 @@ impl CoreRuntime {
                 Ok(json!(to_radix(v, radix)))
             }
 
+            // ---- String methods (receiver is arg 0) ----
+            ("core", "String.length") => Ok(json!(as_str(args, 0)?.chars().count())),
+            ("core", "String.toUpperCase") => Ok(json!(as_str(args, 0)?.to_uppercase())),
+            ("core", "String.toLowerCase") => Ok(json!(as_str(args, 0)?.to_lowercase())),
+            ("core", "String.trim") => Ok(json!(as_str(args, 0)?.trim())),
+            ("core", "String.contains") => {
+                Ok(json!(as_str(args, 0)?.contains(&as_str(args, 1)?)))
+            }
+            ("core", "String.indexOf") => {
+                let s = as_str(args, 0)?;
+                let needle = as_str(args, 1)?;
+                Ok(json!(s.find(&needle).map(|b| s[..b].chars().count() as i64).unwrap_or(-1)))
+            }
+            ("core", "String.substring") => {
+                let s = as_str(args, 0)?;
+                let chars: Vec<char> = s.chars().collect();
+                let start = as_usize(args, 1)?;
+                let end = args.get(2).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(chars.len());
+                if start > end || end > chars.len() {
+                    return Err(format!("RangeError: substring({start}, {end}) of length {}", chars.len()));
+                }
+                Ok(json!(chars[start..end].iter().collect::<String>()))
+            }
+            ("core", "String.replaceAll") => {
+                let s = as_str(args, 0)?;
+                Ok(json!(s.replace(&as_str(args, 1)?, &as_str(args, 2)?)))
+            }
+            ("core", "String.split") => {
+                let s = as_str(args, 0)?;
+                let sep = as_str(args, 1)?;
+                Ok(json!(s.split(&sep).map(|p| p.to_string()).collect::<Vec<_>>()))
+            }
+            ("core", "String.padLeft") => {
+                let s = as_str(args, 0)?;
+                let width = as_usize(args, 1)?;
+                let pad = args.get(2).and_then(|v| v.as_str()).unwrap_or(" ").chars().next().unwrap_or(' ');
+                let deficit = width.saturating_sub(s.chars().count());
+                Ok(json!(format!("{}{}", pad.to_string().repeat(deficit), s)))
+            }
+
             ("math", "Random") => {
                 // args: [seed?]  -> returns an opaque Random handle.
                 let seed = args
@@ -246,6 +286,17 @@ mod tests {
             assert_eq!(va, vb);
             assert!(va.as_i64().unwrap() >= 0 && va.as_i64().unwrap() < 1000);
         }
+    }
+
+    #[test]
+    fn string_methods() {
+        let mut c = CoreRuntime::new(Clock::Fixed(0));
+        assert_eq!(c.dispatch("core", "String.toUpperCase", &[json!("abc")]).unwrap(), json!("ABC"));
+        assert_eq!(c.dispatch("core", "String.substring", &[json!("hello"), json!(1), json!(4)]).unwrap(), json!("ell"));
+        assert_eq!(c.dispatch("core", "String.indexOf", &[json!("hello"), json!("l")]).unwrap(), json!(2));
+        assert_eq!(c.dispatch("core", "String.split", &[json!("a,b,c"), json!(",")]).unwrap(), json!(["a","b","c"]));
+        assert_eq!(c.dispatch("core", "String.replaceAll", &[json!("aaa"), json!("a"), json!("b")]).unwrap(), json!("bbb"));
+        assert_eq!(c.dispatch("core", "String.padLeft", &[json!("7"), json!(3), json!("0")]).unwrap(), json!("007"));
     }
 
     #[test]
