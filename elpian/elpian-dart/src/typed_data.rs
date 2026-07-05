@@ -16,10 +16,24 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
+/// A typed-list view over a byte buffer (`Uint8List`, `Int32List`, `Float64List`
+/// …) — an element-indexed window, exactly like Dart's typed list backed by a
+/// `ByteBuffer`.
+#[derive(Debug, Clone, Copy)]
+struct View {
+    buffer: u32,
+    elem_size: usize,
+    offset_bytes: usize,
+    length_elems: usize,
+    /// 0 = Uint8, 1 = Int32, 2 = Float64.
+    kind: u8,
+}
+
 /// Host-side store of byte buffers, keyed by the handle the guest holds.
 #[derive(Debug, Default)]
 pub struct TypedDataStore {
     buffers: HashMap<u32, Vec<u8>>,
+    views: HashMap<u32, View>,
     next_id: u32,
 }
 
@@ -130,8 +144,123 @@ impl TypedDataStore {
                 }
                 Ok(json!(f64::from_le_bytes(raw)))
             }
+            "ByteData.setRange" => {
+                // args: [dstHandle, start, end, srcHandle, srcStart]
+                let dst = as_u32(args, 0)?;
+                let start = as_usize(args, 1)?;
+                let end = as_usize(args, 2)?;
+                let src = as_u32(args, 3)?;
+                let src_start = as_usize(args, 4)?;
+                let count = end.saturating_sub(start);
+                let src_bytes = {
+                    let sb = self.buf(src)?;
+                    if src_start + count > sb.len() {
+                        return Err(format!(
+                            "RangeError: source range {src_start}+{count} exceeds {}",
+                            sb.len()
+                        ));
+                    }
+                    sb[src_start..src_start + count].to_vec()
+                };
+                let db = self.buf_mut(dst)?;
+                bounds(db.len(), start, count)?;
+                db[start..start + count].copy_from_slice(&src_bytes);
+                Ok(Value::Null)
+            }
+
+            // ---- Typed list views (Uint8List / Int32List / Float64List) ----
+            "Uint8List.view" => self.make_view(args, 1, 0),
+            "Int32List.view" => self.make_view(args, 4, 1),
+            "Float64List.view" => self.make_view(args, 8, 2),
+            "TypedList.length" => {
+                let v = self.view(as_u32(args, 0)?)?;
+                Ok(json!(v.length_elems))
+            }
+            "TypedList.getAt" => {
+                let view = *self.view(as_u32(args, 0)?)?;
+                let index = as_usize(args, 1)?;
+                self.view_get(&view, index)
+            }
+            "TypedList.setAt" => {
+                let view = *self.view(as_u32(args, 0)?)?;
+                let index = as_usize(args, 1)?;
+                let value = arg(args, 2)?.clone();
+                self.view_set(&view, index, &value)
+            }
+
             other => Err(format!("NoSuchMethodError: dart:typed_data/{other}")),
         }
+    }
+
+    /// Create a typed-list view: args `[bufferHandle, offsetBytes, lengthElems]`.
+    fn make_view(&mut self, args: &[Value], elem_size: usize, kind: u8) -> OpResult {
+        let buffer = as_u32(args, 0)?;
+        let offset_bytes = as_usize(args, 1)?;
+        let length_elems = as_usize(args, 2)?;
+        let blen = self.buf(buffer)?.len();
+        if offset_bytes + length_elems * elem_size > blen {
+            return Err(format!(
+                "RangeError: view {offset_bytes}+{length_elems}*{elem_size} exceeds buffer {blen}"
+            ));
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.views.insert(
+            id,
+            View { buffer, elem_size, offset_bytes, length_elems, kind },
+        );
+        Ok(json!(id))
+    }
+
+    fn view(&self, id: u32) -> Result<&View, String> {
+        self.views
+            .get(&id)
+            .ok_or_else(|| format!("StateError: no typed list for handle {id}"))
+    }
+
+    fn view_get(&self, v: &View, index: usize) -> OpResult {
+        if index >= v.length_elems {
+            return Err(format!("RangeError: index {index} for length {}", v.length_elems));
+        }
+        let off = v.offset_bytes + index * v.elem_size;
+        let b = self.buf(v.buffer)?;
+        match v.kind {
+            0 => Ok(json!(b[off] as u64)),
+            1 => {
+                let mut raw = [0u8; 4];
+                raw.copy_from_slice(&b[off..off + 4]);
+                Ok(json!(i32::from_le_bytes(raw)))
+            }
+            2 => {
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(&b[off..off + 8]);
+                Ok(json!(f64::from_le_bytes(raw)))
+            }
+            _ => Err("unknown view kind".into()),
+        }
+    }
+
+    fn view_set(&mut self, v: &View, index: usize, value: &Value) -> OpResult {
+        if index >= v.length_elems {
+            return Err(format!("RangeError: index {index} for length {}", v.length_elems));
+        }
+        let off = v.offset_bytes + index * v.elem_size;
+        let b = self.buf_mut(v.buffer)?;
+        match v.kind {
+            0 => {
+                b[off] = value.as_i64().unwrap_or(0) as u8;
+            }
+            1 => {
+                let bytes = (value.as_i64().unwrap_or(0) as i32).to_le_bytes();
+                b[off..off + 4].copy_from_slice(&bytes);
+            }
+            2 => {
+                let bytes = value.as_f64().unwrap_or(0.0).to_le_bytes();
+                b[off..off + 8].copy_from_slice(&bytes);
+            }
+            _ => return Err("unknown view kind".into()),
+        }
+        Ok(Value::Null)
     }
 }
 
@@ -230,6 +359,36 @@ mod tests {
             .dispatch("ByteData.getFloat64", &[json!(h), json!(0), json!(true)])
             .unwrap();
         assert_eq!(got, json!(3.5));
+    }
+
+    #[test]
+    fn int32list_view_indexes_elements() {
+        let mut s = TypedDataStore::new();
+        let buf = s.dispatch("ByteData.alloc", &[json!(16)]).unwrap().as_u64().unwrap() as i64;
+        // Int32List view of 4 elements over the 16-byte buffer.
+        let view = s
+            .dispatch("Int32List.view", &[json!(buf), json!(0), json!(4)])
+            .unwrap()
+            .as_u64()
+            .unwrap() as i64;
+        s.dispatch("TypedList.setAt", &[json!(view), json!(2), json!(999)]).unwrap();
+        let got = s.dispatch("TypedList.getAt", &[json!(view), json!(2)]).unwrap();
+        assert_eq!(got, json!(999));
+        assert_eq!(s.dispatch("TypedList.length", &[json!(view)]).unwrap(), json!(4));
+        // Element 2 lives at byte offset 8; ByteData sees the same bytes.
+        let via_bytedata = s.dispatch("ByteData.getInt32", &[json!(buf), json!(8), json!(true)]).unwrap();
+        assert_eq!(via_bytedata, json!(999));
+    }
+
+    #[test]
+    fn set_range_copies_bytes() {
+        let mut s = TypedDataStore::new();
+        let src = s.dispatch("ByteData.alloc", &[json!(4)]).unwrap().as_u64().unwrap() as i64;
+        let dst = s.dispatch("ByteData.alloc", &[json!(4)]).unwrap().as_u64().unwrap() as i64;
+        s.dispatch("ByteData.setInt32", &[json!(src), json!(0), json!(0x01020304), json!(true)]).unwrap();
+        s.dispatch("ByteData.setRange", &[json!(dst), json!(0), json!(4), json!(src), json!(0)]).unwrap();
+        let got = s.dispatch("ByteData.getInt32", &[json!(dst), json!(0), json!(true)]).unwrap();
+        assert_eq!(got, json!(0x01020304));
     }
 
     #[test]

@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use elpian_vm::api::{self, VmExecResult};
 use elpian_vm::sdk::capabilities::Capability;
 
+use crate::core::{Clock, CoreRuntime};
 use crate::dart_ui::SceneRecorder;
 use crate::governance::{required_capability, DartCapability, DartCapabilitySet, ResourceMeter};
 use crate::typed_data::TypedDataStore;
@@ -34,6 +35,7 @@ pub struct DartRuntime {
     meter: ResourceMeter,
     typed_data: TypedDataStore,
     ui: SceneRecorder,
+    core: CoreRuntime,
     emitted: Vec<Value>,
     log: Vec<String>,
     denied: Vec<String>,
@@ -60,10 +62,17 @@ impl DartRuntime {
             meter,
             typed_data: TypedDataStore::new(),
             ui: SceneRecorder::new(),
+            core: CoreRuntime::new(Clock::System),
             emitted: Vec::new(),
             log: Vec::new(),
             denied: Vec::new(),
         })
+    }
+
+    /// Pin the clock (and thus `DateTime.now`) for reproducible runs/tests.
+    pub fn with_fixed_clock(mut self, millis_since_epoch: i64) -> Self {
+        self.core = CoreRuntime::new(Clock::Fixed(millis_since_epoch));
+        self
     }
 
     /// Values the guest pushed out via `askHost("test.emit", [v])` — a tiny
@@ -159,6 +168,7 @@ impl DartRuntime {
         let result = match library {
             "typed_data" => self.typed_data.dispatch(method, args),
             "ui" => self.ui.dispatch(method, args),
+            "core" | "math" => self.core.dispatch(library, method, args),
             other => Err(format!("unimplemented library dart:{other} (method {method})")),
         };
 

@@ -49,6 +49,32 @@ fn guest_records_a_ui_scene() {
     assert_eq!(scene["root"]["ops"][0]["color"], 4294901760u64);
 }
 
+/// Guest uses `dart:math` (seeded Random) and `dart:core` (DateTime.now with a
+/// pinned clock) end-to-end, proving the core/math wiring and determinism.
+#[test]
+fn guest_uses_core_and_math() {
+    let code = r#"
+        var rng = askHost("dart:math/Random", [42]);
+        var a = askHost("dart:math/Random.nextInt", [rng, 1000]);
+        var now = askHost("dart:core/DateTime.now", []);
+        askHost("test.emit", [a]);
+        askHost("test.emit", [now]);
+    "#;
+    let mut rt = DartRuntime::from_js(
+        "core_test",
+        code,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles")
+    .with_fixed_clock(1_700_000_000_000);
+    rt.run().expect("runs");
+    // Seed 42 is deterministic; assert the value is in range and the clock pinned.
+    let a = rt.emitted()[0].as_i64().unwrap();
+    assert!((0..1000).contains(&a));
+    assert_eq!(rt.emitted()[1], serde_json::json!(1_700_000_000_000i64));
+}
+
 /// Governance: with the `Painting` capability revoked, a `dart:ui` call is
 /// denied by the governor and the guest receives a thrown-error envelope rather
 /// than reaching the library.

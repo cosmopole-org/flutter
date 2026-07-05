@@ -39,12 +39,14 @@
 //! Nothing here claims to run the unmodified Flutter framework kernel today; it
 //! is the foundation that a Dart front-end + framework port targets.
 
+pub mod core;
 pub mod dart_ui;
 pub mod governance;
 pub mod runtime;
 pub mod typed_data;
 pub mod value;
 
+pub use core::Clock;
 pub use governance::{DartCapability, DartCapabilitySet, ResourceMeter};
 pub use runtime::{DartError, DartRuntime};
 pub use value::DartNum;
