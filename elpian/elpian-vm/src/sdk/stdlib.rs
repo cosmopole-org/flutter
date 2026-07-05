@@ -875,6 +875,121 @@ pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
             Ok(args[0].clone())
         }
 
+        // ---- bound core-type methods (receiver threaded as args[0]) --------
+        "List.add" => {
+            at_least(name, args, 2)?;
+            args[0].as_array().borrow_mut().data.push(args[1].clone());
+            Ok(Val::new(0, Payload::Null))
+        }
+        "List.removeLast" => {
+            let popped = args[0].as_array().borrow_mut().data.pop();
+            Ok(popped.unwrap_or_else(|| Val::new(0, Payload::Null)))
+        }
+        "List.first" => {
+            let a = args[0].as_array();
+            let out = a.borrow().data.first().cloned();
+            Ok(out.unwrap_or_else(|| Val::new(0, Payload::Null)))
+        }
+        "List.last" => {
+            let a = args[0].as_array();
+            let out = a.borrow().data.last().cloned();
+            Ok(out.unwrap_or_else(|| Val::new(0, Payload::Null)))
+        }
+        "List.contains" => {
+            at_least(name, args, 2)?;
+            let target = args[1].stringify();
+            let a = args[0].as_array();
+            let found = a.borrow().data.iter().any(|e| e.stringify() == target);
+            Ok(vbool(found))
+        }
+        "List.indexOf" => {
+            at_least(name, args, 2)?;
+            let target = args[1].stringify();
+            let a = args[0].as_array();
+            let idx = a
+                .borrow()
+                .data
+                .iter()
+                .position(|e| e.stringify() == target)
+                .map(|i| i as i64)
+                .unwrap_or(-1);
+            Ok(vi64(idx))
+        }
+        "List.sublist" => {
+            at_least(name, args, 2)?;
+            let a = args[0].as_array();
+            let b = a.borrow();
+            let start = (as_int(&args[1])? as usize).min(b.data.len());
+            let end = match args.get(2) {
+                Some(v) => (as_int(v)? as usize).min(b.data.len()),
+                None => b.data.len(),
+            }
+            .max(start);
+            Ok(varr(b.data[start..end].to_vec()))
+        }
+        "List.join" => {
+            let a = args[0].as_array();
+            let sep = args.get(1).map(|v| v.as_string()).unwrap_or_default();
+            let joined = a
+                .borrow()
+                .data
+                .iter()
+                .map(|e| if e.typ == 7 { e.as_string() } else { e.stringify() })
+                .collect::<Vec<_>>()
+                .join(&sep);
+            Ok(vstr(joined))
+        }
+        "String.toUpperCase" => Ok(vstr(args[0].as_string().to_uppercase())),
+        "String.toLowerCase" => Ok(vstr(args[0].as_string().to_lowercase())),
+        "String.trim" => Ok(vstr(args[0].as_string().trim().to_string())),
+        "String.contains" => {
+            at_least(name, args, 2)?;
+            Ok(vbool(args[0].as_string().contains(&args[1].as_string())))
+        }
+        "String.startsWith" => {
+            at_least(name, args, 2)?;
+            Ok(vbool(args[0].as_string().starts_with(&args[1].as_string())))
+        }
+        "String.endsWith" => {
+            at_least(name, args, 2)?;
+            Ok(vbool(args[0].as_string().ends_with(&args[1].as_string())))
+        }
+        "String.replaceAll" => {
+            at_least(name, args, 3)?;
+            Ok(vstr(args[0].as_string().replace(&args[1].as_string(), &args[2].as_string())))
+        }
+        "String.indexOf" => {
+            at_least(name, args, 2)?;
+            let s = args[0].as_string();
+            let needle = args[1].as_string();
+            let idx = s.find(&needle).map(|b| s[..b].chars().count() as i64).unwrap_or(-1);
+            Ok(vi64(idx))
+        }
+        "String.substring" => {
+            at_least(name, args, 2)?;
+            let s = args[0].as_string();
+            let chars: Vec<char> = s.chars().collect();
+            let start = (as_int(&args[1])? as usize).min(chars.len());
+            let end = match args.get(2) {
+                Some(v) => (as_int(v)? as usize).min(chars.len()),
+                None => chars.len(),
+            }
+            .max(start);
+            Ok(vstr(chars[start..end].iter().collect()))
+        }
+        "String.split" => {
+            at_least(name, args, 2)?;
+            let s = args[0].as_string();
+            let sep = args[1].as_string();
+            Ok(varr(s.split(&sep).map(|p| vstr(p.to_string())).collect()))
+        }
+        "String.codeUnitAt" => {
+            at_least(name, args, 2)?;
+            let s = args[0].as_string();
+            let i = as_int(&args[1])? as usize;
+            Ok(vi64(s.encode_utf16().nth(i).map(|c| c as i64).unwrap_or(0)))
+        }
+
         _ => Err(format!("unknown builtin '{name}'")),
     }
 }

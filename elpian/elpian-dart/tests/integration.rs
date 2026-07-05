@@ -481,3 +481,49 @@ fn dart_list_and_string_length() {
         &[serde_json::json!(100), serde_json::json!(7), serde_json::json!(false)]
     );
 }
+
+/// VM conformance: bound native methods on core types — idiomatic Dart method
+/// calls on List and String now dispatch through the VM (mutating add, queries,
+/// string transforms), while user-class instance methods still work.
+#[test]
+fn dart_core_type_methods() {
+    let dart = r#"
+        class Greeter {
+            String greet(String who) { return "hi " + who; }
+        }
+        void main() {
+            var xs = [1, 2, 3];
+            xs.add(4);
+            xs.add(5);
+            askHost("test.emit", [xs.length]);
+            askHost("test.emit", [xs.contains(4)]);
+            askHost("test.emit", [xs.indexOf(3)]);
+            var s = "Hello, Flutter";
+            askHost("test.emit", [s.toUpperCase()]);
+            askHost("test.emit", [s.substring(7)]);
+            askHost("test.emit", [s.split(", ").length]);
+            var g = Greeter();
+            askHost("test.emit", [g.greet("world")]);
+        }
+    "#;
+    let mut rt = DartRuntime::from_dart(
+        "methods_test",
+        dart,
+        DartCapabilitySet::full(),
+        ResourceMeter::unbounded(),
+    )
+    .expect("compiles");
+    rt.run().expect("runs");
+    assert_eq!(
+        rt.emitted(),
+        &[
+            serde_json::json!(5),                 // 3 + add(4) + add(5)
+            serde_json::json!(true),              // contains(4)
+            serde_json::json!(2),                 // indexOf(3)
+            serde_json::json!("HELLO, FLUTTER"),
+            serde_json::json!("Flutter"),
+            serde_json::json!(2),                 // split(", ").length
+            serde_json::json!("hi world"),        // instance method still works
+        ]
+    );
+}

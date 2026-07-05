@@ -417,6 +417,21 @@ impl Operation for CallFunction {
                 let name = callee.as_string();
                 self.func = Some(Rc::new(RefCell::new(Function::new(name, 0, 0, Vec::new()))));
                 self.is_native = true;
+            } else if callee.typ == 253 {
+                // Bound native method: [receiver, "Type.method"]. Dispatch as a
+                // native builtin whose receiver is threaded via `this_arg` and
+                // prepended to the argument list at the call site.
+                let holder = callee.as_array();
+                let (receiver, name) = {
+                    let b = holder.borrow();
+                    (b.data[0].clone(), b.data[1].as_string())
+                };
+                // Keep the builtin name (bind() would blank it) and thread the
+                // receiver via this_arg so native dispatch prepends it.
+                let mut f = Function::new(name, 0, 0, Vec::new());
+                f.this_arg = Some(receiver);
+                self.func = Some(Rc::new(RefCell::new(f)));
+                self.is_native = true;
             } else {
                 panic!("elpian error: the specified data is not runnable");
             }
@@ -773,6 +788,32 @@ impl Operation for Arithmetic {
             self.arg2.clone().unwrap(),
         ]
     }
+}
+
+/// Core `List` method names that resolve to a bound native method (typ 253).
+fn is_list_method(key: &str) -> bool {
+    matches!(
+        key,
+        "add" | "contains" | "indexOf" | "removeLast" | "first" | "last" | "sublist" | "join"
+    )
+}
+
+/// Core `String` method names that resolve to a bound native method.
+fn is_string_method(key: &str) -> bool {
+    matches!(
+        key,
+        "substring"
+            | "contains"
+            | "indexOf"
+            | "toUpperCase"
+            | "toLowerCase"
+            | "trim"
+            | "split"
+            | "startsWith"
+            | "endsWith"
+            | "replaceAll"
+            | "codeUnitAt"
+    )
 }
 
 struct IndexerValue {
@@ -4342,7 +4383,16 @@ impl Executor {
                                 let func_ref = func.borrow();
                                 let arg_arr = regs[3].as_array();
                                 let arg_ref = arg_arr.borrow();
-                                let outcome = stdlib::invoke(&func_ref.name, &arg_ref.data);
+                                // A bound native method (core-type method) threads
+                                // its receiver as the first argument.
+                                let outcome = if let Some(recv) = func_ref.this_arg.clone() {
+                                    let mut combined = Vec::with_capacity(arg_ref.data.len() + 1);
+                                    combined.push(recv);
+                                    combined.extend(arg_ref.data.iter().cloned());
+                                    stdlib::invoke(&func_ref.name, &combined)
+                                } else {
+                                    stdlib::invoke(&func_ref.name, &arg_ref.data)
+                                };
                                 match outcome {
                                     Ok(result) => {
                                         drop(arg_ref);
@@ -4743,6 +4793,23 @@ impl Executor {
                                     "length" => self.check_int_range(len as i64),
                                     "isEmpty" => Val { typ: 6, data: Payload::from(len == 0) },
                                     _ => Val { typ: 6, data: Payload::from(len != 0) },
+                                });
+                            } else if (indexed.typ == 9 && is_list_method(&__key))
+                                || (indexed.typ == 7 && is_string_method(&__key))
+                            {
+                                // A core-type method: return a bound native method
+                                // (typ 253) carrying the receiver + dispatch name.
+                                // The call machinery prepends the receiver and
+                                // dispatches through stdlib::invoke.
+                                let prefix = if indexed.typ == 9 { "List." } else { "String." };
+                                let name_val = Val {
+                                    typ: 7,
+                                    data: Payload::from(format!("{prefix}{__key}")),
+                                };
+                                let holder = Array::new(vec![indexed.clone(), name_val]);
+                                main_reg = Some(Val {
+                                    typ: 253,
+                                    data: Payload::from(Rc::new(RefCell::new(holder))),
                                 });
                             } else if indexed.typ == 8 {
                                 let key = index.as_string();
