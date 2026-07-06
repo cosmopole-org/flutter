@@ -1,14 +1,22 @@
-//! The authoritative catalog of built-in **type methods** — the members exposed
-//! by core values (`List`, `String`, `num`, `Map`). It is the single owner of
-//! every type-method *name* and of *how* each dispatches, so the executor holds
-//! no hardcoded method knowledge: it asks [`resolve`] and acts on the returned
-//! [`Member`]. The *implementations* live in [`crate::sdk::stdlib`]; this module
-//! maps a `(type, name)` pair to a qualified stdlib key plus a dispatch strategy.
+//! The catalog of **core-type members** — the members callable on a built-in
+//! value (`List`, `String`, `num`, `Map`) — named with the VM's single, universal
+//! stdlib vocabulary.
 //!
-//! Organised object-orientedly — one submodule per core type, each declaring its
-//! own members — so adding a method is a one-line change in exactly one place,
-//! and the executor never duplicates a method name. This is the decoupling seam
-//! between *what* a type can do (here) and *how the interpreter delivers it*.
+//! This module answers one question for the executor: *does `receiver.name`
+//! name a core-type member, and if so how is it delivered?* The `name` it is
+//! asked about is already a **universal** Elpian name (`push`, `upper`, `has`,
+//! `reversed`, …): a source front-end (`dart2elpian` / `js2elpian`) has mapped
+//! its own spelling (`add`, `toUpperCase`, `containsKey`, …) onto the universal
+//! name at *compile time*. The VM therefore carries no Dart- or JS-specific
+//! method names and does no name translation at runtime.
+//!
+//! Delivery is direct: a resolved member is realised by the *same*
+//! [`crate::sdk::stdlib::invoke`] the bare-function surface uses, called with the
+//! receiver as the first argument. There is no separate per-type implementation
+//! and nothing is proxied — the member name *is* the builtin name.
+//!
+//! Organised object-orientedly (one submodule per core type) so adding a member
+//! is a one-line change in exactly one place.
 
 /// A core built-in type, identified from a VM value's type tag.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,8 +41,8 @@ impl CoreType {
         }
     }
 
-    /// The stdlib namespace prefix for this type's members (`List.add`, …).
-    pub fn prefix(self) -> &'static str {
+    /// The prefix of this type's guest prelude helpers (`__List_map`, …).
+    pub fn prelude_prefix(self) -> &'static str {
         match self {
             CoreType::List => "List",
             CoreType::String => "String",
@@ -47,26 +55,29 @@ impl CoreType {
 /// How a resolved member is delivered to the executor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dispatch {
-    /// A getter (read, no call): evaluate now via
-    /// `stdlib::invoke(qualified, &[receiver])`.
+    /// A getter (read, no call): evaluate now via `stdlib::invoke(name, &[recv])`.
     Getter,
     /// A method: hand back a bound native (VM type-tag 253) that, when called,
-    /// runs `stdlib::invoke(qualified, &[receiver, ..args])`.
+    /// runs `stdlib::invoke(name, &[receiver, ..args])`.
     Method,
     /// A higher-order method realised as the guest prelude fn `__<Type>_<name>`,
     /// bound to the receiver so its closure argument runs as guest bytecode.
     Prelude,
 }
 
-/// A resolved member: how it dispatches, its fully-qualified stdlib key
-/// (`"List.add"`), and its bare name (for prelude binding: `__List_<name>`).
+/// A resolved member: how it dispatches, the universal stdlib name that
+/// implements it (`"push"`, `"upper"`, …), and — for a [`Dispatch::Prelude`]
+/// member — the guest prelude function that realises it (`"__List_map"`).
 pub struct Member {
     pub dispatch: Dispatch,
-    pub qualified: String,
+    /// The universal builtin name; used directly by `stdlib::invoke`.
     pub name: String,
+    /// The prelude function name (`__<Type>_<name>`), meaningful only when
+    /// `dispatch == Prelude`.
+    pub prelude_fn: String,
 }
 
-/// Resolve `name` as a member of `ty`, or `None` if the type has no such member.
+/// Resolve `name` (a universal Elpian name) as a member of `ty`, or `None`.
 pub fn resolve(ty: CoreType, name: &str) -> Option<Member> {
     let dispatch = match ty {
         CoreType::List => list::dispatch(name),
@@ -76,8 +87,8 @@ pub fn resolve(ty: CoreType, name: &str) -> Option<Member> {
     }?;
     Some(Member {
         dispatch,
-        qualified: format!("{}.{}", ty.prefix(), name),
         name: name.to_string(),
+        prelude_fn: format!("__{}_{}", ty.prelude_prefix(), name),
     })
 }
 
@@ -91,14 +102,15 @@ pub fn has(ty: CoreType, name: &str) -> bool {
 
 mod list {
     use super::Dispatch;
-    /// Members of `List`. Getters read eagerly; the higher-order closure methods
-    /// run as guest prelude functions; the rest are bound native methods.
+    /// Members of `List`, named universally. Getters read eagerly; the
+    /// higher-order closure methods run as guest prelude functions; the rest are
+    /// bound native methods delegating straight to the like-named builtin.
     pub fn dispatch(name: &str) -> Option<Dispatch> {
         Some(match name {
             "first" | "last" | "reversed" => Dispatch::Getter,
             "map" | "where" | "forEach" | "fold" | "any" | "every" | "reduce" => Dispatch::Prelude,
-            "add" | "contains" | "indexOf" | "removeLast" | "sublist" | "join" | "addAll"
-            | "removeAt" | "insert" | "clear" => Dispatch::Method,
+            "push" | "contains" | "indexOf" | "pop" | "slice" | "join" | "pushAll" | "removeAt"
+            | "insert" | "clear" => Dispatch::Method,
             _ => return None,
         })
     }
@@ -109,9 +121,9 @@ mod string {
     /// Members of `String` — all bound native methods over the receiver string.
     pub fn dispatch(name: &str) -> Option<Dispatch> {
         Some(match name {
-            "substring" | "contains" | "indexOf" | "toUpperCase" | "toLowerCase" | "trim"
-            | "split" | "startsWith" | "endsWith" | "replaceAll" | "codeUnitAt" | "padRight"
-            | "padLeft" | "replaceFirst" | "trimLeft" | "trimRight" => Dispatch::Method,
+            "substring" | "contains" | "indexOf" | "upper" | "lower" | "trim" | "trimStart"
+            | "trimEnd" | "split" | "startsWith" | "endsWith" | "replace" | "replaceFirst"
+            | "codeUnitAt" | "padStart" | "padEnd" => Dispatch::Method,
             _ => return None,
         })
     }
@@ -123,7 +135,7 @@ mod num {
     pub fn dispatch(name: &str) -> Option<Dispatch> {
         Some(match name {
             "isNaN" | "isNegative" => Dispatch::Getter,
-            "toInt" | "toDouble" | "abs" | "floor" | "ceil" | "round" | "toString"
+            "int" | "toDouble" | "abs" | "floor" | "ceil" | "round" | "toString"
             | "toStringAsFixed" | "clamp" => Dispatch::Method,
             _ => return None,
         })
@@ -136,7 +148,7 @@ mod map {
     pub fn dispatch(name: &str) -> Option<Dispatch> {
         Some(match name {
             "keys" | "values" | "isEmpty" | "isNotEmpty" => Dispatch::Getter,
-            "containsKey" | "remove" | "putIfAbsent" => Dispatch::Method,
+            "has" | "remove" | "putIfAbsent" => Dispatch::Method,
             _ => return None,
         })
     }
@@ -148,19 +160,22 @@ mod tests {
 
     #[test]
     fn resolves_by_type_and_kind() {
-        assert_eq!(resolve(CoreType::List, "add").unwrap().dispatch, Dispatch::Method);
+        assert_eq!(resolve(CoreType::List, "push").unwrap().dispatch, Dispatch::Method);
         assert_eq!(resolve(CoreType::List, "first").unwrap().dispatch, Dispatch::Getter);
         assert_eq!(resolve(CoreType::List, "map").unwrap().dispatch, Dispatch::Prelude);
-        assert_eq!(resolve(CoreType::String, "toUpperCase").unwrap().dispatch, Dispatch::Method);
+        assert_eq!(resolve(CoreType::String, "upper").unwrap().dispatch, Dispatch::Method);
         assert_eq!(resolve(CoreType::Num, "isNaN").unwrap().dispatch, Dispatch::Getter);
         assert_eq!(resolve(CoreType::Map, "keys").unwrap().dispatch, Dispatch::Getter);
-        assert_eq!(resolve(CoreType::List, "add").unwrap().qualified, "List.add");
+        // The resolved name is the universal builtin name, used directly by
+        // `stdlib::invoke` — no `Type.method` qualifier.
+        assert_eq!(resolve(CoreType::List, "push").unwrap().name, "push");
+        assert_eq!(resolve(CoreType::List, "map").unwrap().prelude_fn, "__List_map");
     }
 
     #[test]
     fn unknown_members_are_none() {
         assert!(resolve(CoreType::List, "nope").is_none());
-        assert!(!has(CoreType::String, "add")); // add is a List method, not String
+        assert!(!has(CoreType::String, "push")); // push is a List member, not String
         assert!(CoreType::of_tag(99).is_none());
         assert_eq!(CoreType::of_tag(9), Some(CoreType::List));
     }

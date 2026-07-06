@@ -306,10 +306,72 @@ struct JsParser {
     /// with no explicit constructor can synthesise one that forwards those args to
     /// `super` (JS's implicit-constructor behaviour).
     class_ctor_params: HashMap<String, Vec<String>>,
+    /// Every method name declared by a class in the program (collected up front,
+    /// since a call site can textually precede the declaration). A JS core-member
+    /// spelling that collides with one of these is left untranslated so a user's
+    /// own method still resolves against its object.
+    user_members: HashSet<String>,
+}
+
+/// Compile-time resolution of a standard JavaScript core-type member spelling to
+/// the VM's single **universal** stdlib name — the js2elpian counterpart of the
+/// Dart front-end's mapping. Names JS already spells the universal way (`push`,
+/// `pop`, `slice`, `indexOf`, `concat`, `split`, `substring`, `charAt`, `trim`,
+/// `join`, `keys`, `values`, …) need no entry. Returns `None` when unchanged.
+fn js_universal_member(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "includes" => "contains",
+        "toUpperCase" => "upper",
+        "toLowerCase" => "lower",
+        "charCodeAt" => "codeUnitAt",
+        _ => return None,
+    })
+}
+
+/// Scan the token stream for class method declarations — an identifier at
+/// class-body brace depth immediately followed by `(`. Used to guard the
+/// JS→universal member rename against a user's own like-named methods.
+fn collect_class_members(toks: &[JsTok]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if matches!(&toks[i], JsTok::Ident(k) if k == "class") {
+            // Advance to the opening brace of the class body.
+            while i < toks.len() && !matches!(&toks[i], JsTok::Punct(p) if p == "{") {
+                i += 1;
+            }
+            if i >= toks.len() {
+                break;
+            }
+            // Walk the body, recording `ident (` at depth 1 (a member header).
+            let mut depth = 0i32;
+            while i < toks.len() {
+                match &toks[i] {
+                    JsTok::Punct(p) if p == "{" => depth += 1,
+                    JsTok::Punct(p) if p == "}" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    JsTok::Ident(name) if depth == 1 => {
+                        if matches!(toks.get(i + 1), Some(JsTok::Punct(p)) if p == "(") {
+                            out.insert(name.clone());
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 impl JsParser {
     fn new(toks: Vec<JsTok>) -> Self {
+        let user_members = collect_class_members(&toks);
         JsParser {
             toks,
             pos: 0,
@@ -318,6 +380,17 @@ impl JsParser {
             class_parent: None,
             class_statics: HashSet::new(),
             class_ctor_params: HashMap::new(),
+            user_members,
+        }
+    }
+
+    /// Resolve a JS member spelling to the VM's universal name, unless a user
+    /// class declares a method by that name (then it addresses that object).
+    fn resolve_member(&self, name: &str) -> String {
+        if self.user_members.contains(name) {
+            name.to_string()
+        } else {
+            js_universal_member(name).unwrap_or(name).to_string()
         }
     }
     fn peek(&self) -> &JsTok {
@@ -1109,7 +1182,11 @@ impl JsParser {
                     } });
                     continue;
                 }
-                e = json!({ "type": "indexer", "data": { "target": e, "index": js_string(&name) } });
+                // Resolve the JS member spelling to the VM's universal stdlib name
+                // at compile time (`includes`→`contains`, `toUpperCase`→`upper`, …),
+                // so the VM only ever sees universal names.
+                let resolved = self.resolve_member(&name);
+                e = json!({ "type": "indexer", "data": { "target": e, "index": js_string(&resolved) } });
             } else if self.at_punct("[") {
                 self.advance();
                 let idx = self.parse_expr();

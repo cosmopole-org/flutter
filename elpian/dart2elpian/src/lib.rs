@@ -261,5 +261,44 @@ mod tests {
         assert!(js.contains("? 2 : 3"), "got: {js}");
         assert!(js.contains("z += 4"), "got: {js}");
     }
+
+    #[test]
+    fn core_member_spellings_resolve_to_universal_names() {
+        // Dart core-type member spellings are mapped to the VM's universal stdlib
+        // names at compile time — the VM never sees `add`/`toUpperCase`/… .
+        let dart = "void main() {\n\
+                      var xs = [];\n\
+                      xs.add(1);\n\
+                      xs.addAll([2, 3]);\n\
+                      xs.removeLast();\n\
+                      var s = \"hi\".toUpperCase();\n\
+                      var n = (3.7).toInt();\n\
+                      var m = {};\n\
+                      var has = m.containsKey(\"k\");\n\
+                    }";
+        let js = transpile(dart).unwrap();
+        assert!(js.contains("xs.push(1)"), "add -> push: {js}");
+        assert!(js.contains("xs.pushAll("), "addAll -> pushAll: {js}");
+        assert!(js.contains("xs.pop()"), "removeLast -> pop: {js}");
+        assert!(js.contains(".upper()"), "toUpperCase -> upper: {js}");
+        assert!(js.contains(".int()"), "toInt -> int: {js}");
+        assert!(js.contains(".has("), "containsKey -> has: {js}");
+        // None of the Dart spellings survive into the emitted program.
+        assert!(!js.contains(".add(1)"), "no Dart add spelling: {js}");
+        assert!(!js.contains("toUpperCase"), "no Dart toUpperCase spelling: {js}");
+    }
+
+    #[test]
+    fn user_method_named_like_a_core_member_is_not_rewritten() {
+        // A user class method whose name collides with a core spelling (`add`)
+        // must not be rewritten to the `push` builtin — it addresses the object.
+        let dart = "class Bag {\n\
+                      void add(int x) { }\n\
+                    }\n\
+                    void main() { var b = Bag(); b.add(5); }";
+        let js = transpile(dart).unwrap();
+        assert!(js.contains("b.add(5)"), "user add() preserved, not renamed: {js}");
+        assert!(!js.contains("b.push(5)"), "user method not turned into a builtin: {js}");
+    }
 }
 

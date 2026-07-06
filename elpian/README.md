@@ -18,6 +18,12 @@ targets the Dart VM cannot serve dynamically.
   single, unified execution target. Dart-specific semantics — the `~/` and `??`
   operators, reified `is`/`as`, the int/double numeric split, and the
   JSON/UTF-8/Base64 codecs — are **native to the VM**, not front-end shims.
+  Standard-library **API names are universal**: the VM exposes one flat, neutral
+  stdlib surface (`push`, `upper`, `has`, `reversed`, …), and each front-end
+  resolves *its* language's spelling (`List.add`, `toUpperCase`, `Array.push`,
+  `includes`, …) onto that universal name **at compile time**. The VM carries no
+  Dart- or JS-specific method names and does no name translation (no proxying)
+  at runtime.
 - **`dart/`** — the *optional* Dart/Flutter host surface: it drives an Elpian VM
   and services the `dart:*` **foundational ("group 3") libraries** — the native
   surfaces the Flutter framework depends on (`dart:ui`, `dart:typed_data`,

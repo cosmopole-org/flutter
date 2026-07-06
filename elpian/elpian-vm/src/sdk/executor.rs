@@ -422,9 +422,9 @@ impl Operation for CallFunction {
                 self.func = Some(Rc::new(RefCell::new(Function::new(name, 0, 0, Vec::new()))));
                 self.is_native = true;
             } else if callee.typ == 253 {
-                // Bound native method: [receiver, "Type.method"]. Dispatch as a
-                // native builtin whose receiver is threaded via `this_arg` and
-                // prepended to the argument list at the call site.
+                // Bound native method: [receiver, "<universalName>"]. Dispatch as
+                // the like-named native builtin whose receiver is threaded via
+                // `this_arg` and prepended to the argument list at the call site.
                 let holder = callee.as_array();
                 let (receiver, name) = {
                     let b = holder.borrow();
@@ -1788,22 +1788,21 @@ impl Executor {
     /// [`Dispatch`] uniformly. `stdlib::invoke` runs the actual implementation.
     fn deliver_type_member(&mut self, receiver: &Val, member: &type_methods::Member) -> Val {
         match member.dispatch {
-            // A getter reads eagerly through stdlib.
-            Dispatch::Getter => stdlib::invoke(&member.qualified, &[receiver.clone()])
+            // A getter reads eagerly through stdlib — the member name is the
+            // universal builtin name, invoked directly.
+            Dispatch::Getter => stdlib::invoke(&member.name, &[receiver.clone()])
                 .unwrap_or_else(|_| self.check_int_range(0)),
             // A method becomes a bound native (typ 253) carrying `[recv, name]`;
             // the call machinery appends the args and calls `stdlib::invoke`.
             Dispatch::Method => {
-                let name_val = Val { typ: 7, data: Payload::from(member.qualified.clone()) };
+                let name_val = Val { typ: 7, data: Payload::from(member.name.clone()) };
                 let holder = Array::new(vec![receiver.clone(), name_val]);
                 Val { typ: 253, data: Payload::from(Rc::new(RefCell::new(holder))) }
             }
             // A higher-order method binds the guest prelude fn `__<Type>_<name>`
             // to the receiver, so its closure argument runs as guest bytecode.
             Dispatch::Prelude => {
-                let prefix = member.qualified.split('.').next().unwrap_or("");
-                let fname = format!("__{}_{}", prefix, member.name);
-                let g = self.ctx.find_val_globally(&fname);
+                let g = self.ctx.find_val_globally(&member.prelude_fn);
                 if g.typ == 10 {
                     let bound = g.as_func().borrow().bind(receiver.clone());
                     Val { typ: 10, data: Payload::from(Rc::new(RefCell::new(bound))) }
@@ -5006,12 +5005,14 @@ impl Executor {
                                 .filter(|t| *t != CoreType::Map)
                                 .and_then(|t| type_methods::resolve(t, &__key))
                             {
-                                // A built-in List/String/num member: the executor
-                                // holds no method names — the stdlib registry owns
-                                // them and says how to deliver this one (a getter,
-                                // a bound native method, or a prelude closure fn).
-                                // Map members are handled in the object branch below
-                                // (they are gated on the absence of a `__class` tag).
+                                // A built-in List/String/num member, named with the
+                                // universal Elpian vocabulary the front-end already
+                                // resolved to. The executor holds no method names —
+                                // `type_methods` owns them and says how to deliver
+                                // this one (a getter, a bound native method, or a
+                                // prelude closure fn), all straight over the single
+                                // universal `stdlib::invoke`. Map members are handled
+                                // in the object branch below (gated on no `__class`).
                                 main_reg = Some(self.deliver_type_member(&indexed, &member));
                             } else if indexed.typ == 8 {
                                 let key = index.as_string();

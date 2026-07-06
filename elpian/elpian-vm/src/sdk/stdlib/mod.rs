@@ -21,13 +21,20 @@
 //! The executor resolves an unbound identifier to a builtin only when no
 //! user/scope binding shadows it (see `Executor::extract_val`), so guests can
 //! always define their own `len` or `map` and win.
+//!
+//! This is the VM's **single, universal** standard-library surface. There is no
+//! second "type-method" surface and nothing is proxied: a `list.push(x)` /
+//! `str.upper()` member call and a bare `push(list, x)` / `upper(str)` call reach
+//! the *same* implementation under the *same* universal name (the executor's
+//! member dispatch, driven by [`crate::sdk::type_methods`], calls straight into
+//! `invoke`). Mapping a source language's spelling (`List.add`, `toUpperCase`,
+//! `Array.push`) onto these universal names is the *compiler's* job — done in
+//! `dart2elpian` / `js2elpian` at compile time — never the VM's at runtime.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::sdk::data::{Array, Object, Payload, Val, ValGroup, ValMap};
-
-pub(crate) mod types;
 
 /// Object `typ` tag for a class descriptor produced by `class` / `extend`.
 pub const CLASS_TYPE: i64 = -100;
@@ -208,14 +215,19 @@ pub const BUILTINS: &[&str] = &[
     // foundation — reflection / conversion + codecs
     "typeOf", "len", "str", "num", "int", "bool", "isNull", "jsonParse", "jsonStringify",
     "base64Encode", "base64Decode", "utf8Encode", "utf8Decode",
-    // foundation — object
+    // foundation — numeric members (universal names for the num core-type members)
+    "toDouble", "isNegative", "toString", "toStringAsFixed",
+    // foundation — object / map
     "keys", "values", "entries", "has", "get", "setKey", "delKey", "merge", "__setIndex",
+    "remove", "putIfAbsent",
     // foundation — array
-    "push", "emit", "pop", "shift", "unshift", "slice", "concat", "reverse", "contains", "indexOf",
-    "join", "range", "first", "last", "sort", "fill",
+    "push", "emit", "pop", "shift", "unshift", "slice", "concat", "reverse", "reversed",
+    "contains", "indexOf", "join", "range", "first", "last", "sort", "fill",
+    "pushAll", "removeAt", "insert", "clear",
     // foundation — string
-    "upper", "lower", "trim", "split", "substring", "charAt", "replace", "repeat", "startsWith",
-    "endsWith", "padStart", "padEnd", "ord", "chr",
+    "upper", "lower", "trim", "trimStart", "trimEnd", "split", "substring", "charAt", "replace",
+    "replaceFirst", "repeat", "startsWith", "endsWith", "padStart", "padEnd", "ord", "chr",
+    "codeUnitAt",
     // oop
     "class", "extend", "new", "method", "field", "setField", "isInstance", "className",
     "parentMethod", "classOf", "superMethod",
@@ -238,17 +250,6 @@ pub fn is_builtin(name: &str) -> bool {
 /// Invoke a builtin by name. Returns the result value or a guest-visible error
 /// string (which the executor surfaces as a trap). `args` are already evaluated.
 pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
-    // Type-method calls (`String.toUpperCase`, `List.add`, `Num.abs`, `Map.keys`)
-    // are grouped object-orientedly per type in `types`; route them there.
-    if let Some((ty, method)) = name.split_once('.') {
-        match ty {
-            "String" => return types::string::invoke(name, method, args),
-            "List" => return types::list::invoke(name, method, args),
-            "Num" => return types::num::invoke(name, method, args),
-            "Map" => return types::map::invoke(name, method, args),
-            _ => {}
-        }
-    }
     match name {
         // ---- math constants -------------------------------------------------
         "PI" => Ok(vf64(std::f64::consts::PI)),
@@ -261,7 +262,16 @@ pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
         "NAN" => Ok(vf64(f64::NAN)),
 
         // ---- math unary -----------------------------------------------------
-        "abs" => unary(name, args, |x| x.abs()),
+        // `abs` preserves the numeric kind: an integer stays an integer, a float
+        // stays a float (so `(-3.0).abs()` is the double `3.0`, not the int `3`).
+        "abs" => {
+            arity(name, args, 1)?;
+            if matches!(args[0].typ, 1 | 2 | 3) {
+                Ok(vi64(as_int(&args[0])?.abs()))
+            } else {
+                Ok(vf64(as_num(&args[0])?.abs()))
+            }
+        }
         "floor" => unary_int(name, args, f64::floor),
         "ceil" => unary_int(name, args, f64::ceil),
         "round" => unary_int(name, args, f64::round),
@@ -429,6 +439,33 @@ pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
             arity(name, args, 1)?;
             Ok(vbool(truthy(&args[0])))
         }
+        // Force a floating-point value (the numeric `toDouble` member): unlike
+        // `num`, never collapses a whole value back to an integer.
+        "toDouble" => {
+            arity(name, args, 1)?;
+            Ok(vf64(as_num(&args[0])?))
+        }
+        "isNegative" => {
+            arity(name, args, 1)?;
+            Ok(vbool(as_num(&args[0])? < 0.0))
+        }
+        // The numeric `toString` member: integers stringify plainly (`3`), floats
+        // always keep a decimal point (`3.0`), matching Dart's `num.toString()`.
+        "toString" => {
+            arity(name, args, 1)?;
+            if matches!(args[0].typ, 1 | 2 | 3) {
+                Ok(vstr(as_int(&args[0])?.to_string()))
+            } else {
+                let d = as_num(&args[0])?;
+                Ok(vstr(if d.fract() == 0.0 { format!("{d:.1}") } else { format!("{d}") }))
+            }
+        }
+        "toStringAsFixed" => {
+            at_least(name, args, 2)?;
+            let d = as_num(&args[0])?;
+            let k = as_int(&args[1])? as usize;
+            Ok(vstr(format!("{d:.*}", k)))
+        }
         "jsonParse" => {
             arity(name, args, 1)?;
             if args[0].typ != 7 {
@@ -572,6 +609,26 @@ pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
             }
             Ok(vobj(-2, m))
         }
+        // Delete a key and return the value that was removed (or null) — the map
+        // `remove` member. Distinct from `delKey`, which returns the map.
+        "remove" => {
+            arity(name, args, 2)?;
+            let o = expect_object(name, &args[0])?;
+            let removed = o.borrow_mut().data.data.remove(&expect_string(name, &args[1])?);
+            Ok(removed.unwrap_or_else(vnull))
+        }
+        // Insert `value` under `key` only if absent, then return the value now
+        // held for `key` — the map `putIfAbsent` member.
+        "putIfAbsent" => {
+            arity(name, args, 3)?;
+            let o = expect_object(name, &args[0])?;
+            let key = expect_string(name, &args[1])?;
+            let mut b = o.borrow_mut();
+            if !b.data.data.contains_key(&key) {
+                b.data.data.insert(key.clone(), args[2].clone());
+            }
+            Ok(b.data.data.get(&key).cloned().unwrap_or_else(vnull))
+        }
 
         // ---- foundation: array ---------------------------------------------
         // Variadic, matching JS `Array.prototype.push(...items)`: append every
@@ -686,6 +743,48 @@ pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
                 _ => Err("reverse expects a string or array".to_string()),
             }
         }
+        // Non-mutating reverse (the list `reversed` getter): yields a fresh array
+        // and leaves the receiver untouched, unlike the in-place `reverse`.
+        "reversed" => {
+            arity(name, args, 1)?;
+            let mut v = expect_array(name, &args[0])?.borrow().data.clone();
+            v.reverse();
+            Ok(varr(v))
+        }
+        // Append every element of another array in place, returning null (the list
+        // `addAll` member). Distinct from `concat`, which builds a new array, and
+        // from `push`, which appends its arguments as individual elements.
+        "pushAll" => {
+            arity(name, args, 2)?;
+            let a = expect_array(name, &args[0])?;
+            let other = expect_array(name, &args[1])?.borrow().data.clone();
+            a.borrow_mut().data.extend(other);
+            Ok(vnull())
+        }
+        "removeAt" => {
+            arity(name, args, 2)?;
+            let a = expect_array(name, &args[0])?;
+            let i = as_int(&args[1])? as usize;
+            let mut b = a.borrow_mut();
+            if i < b.data.len() {
+                Ok(b.data.remove(i))
+            } else {
+                Err("RangeError: removeAt out of range".to_string())
+            }
+        }
+        "insert" => {
+            arity(name, args, 3)?;
+            let a = expect_array(name, &args[0])?;
+            let mut b = a.borrow_mut();
+            let idx = (as_int(&args[1])? as usize).min(b.data.len());
+            b.data.insert(idx, args[2].clone());
+            Ok(vnull())
+        }
+        "clear" => {
+            arity(name, args, 1)?;
+            expect_array(name, &args[0])?.borrow_mut().data.clear();
+            Ok(vnull())
+        }
         "contains" => {
             arity(name, args, 2)?;
             match args[0].typ {
@@ -717,9 +816,14 @@ pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
             }
         }
         "join" => {
-            arity(name, args, 2)?;
+            at_least(name, args, 1)?;
             let a = expect_array(name, &args[0])?;
-            let sep = expect_string(name, &args[1])?;
+            // The separator is optional (defaults to ""); a source language whose
+            // `join` defaults differently supplies its own default at compile time.
+            let sep = match args.get(1) {
+                Some(v) => expect_string(name, v)?,
+                None => String::new(),
+            };
             let parts: Vec<String> = a.borrow().data.iter().map(str_of).collect();
             Ok(vstr(parts.join(&sep)))
         }
@@ -785,6 +889,21 @@ pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
         "upper" => str_map(name, args, |s| s.to_uppercase()),
         "lower" => str_map(name, args, |s| s.to_lowercase()),
         "trim" => str_map(name, args, |s| s.trim().to_string()),
+        "trimStart" => str_map(name, args, |s| s.trim_start().to_string()),
+        "trimEnd" => str_map(name, args, |s| s.trim_end().to_string()),
+        "codeUnitAt" => {
+            at_least(name, args, 2)?;
+            let s = expect_string(name, &args[0])?;
+            let i = as_int(&args[1])? as usize;
+            Ok(vi64(s.encode_utf16().nth(i).map(|c| c as i64).unwrap_or(0)))
+        }
+        "replaceFirst" => {
+            arity(name, args, 3)?;
+            let s = expect_string(name, &args[0])?;
+            let from = expect_string(name, &args[1])?;
+            let to = expect_string(name, &args[2])?;
+            Ok(vstr(s.replacen(&from as &str, &to, 1)))
+        }
         "split" => {
             arity(name, args, 2)?;
             let s = expect_string(name, &args[0])?;
@@ -1455,38 +1574,55 @@ mod tests {
     }
 
     #[test]
-    fn type_methods_delegate_to_the_single_builtin_implementation() {
-        // The Dart-style member surface (`List.contains`, `String.toUpperCase`,
-        // `Map.containsKey`, `Num.floor`) and the functional builtin surface
-        // (`contains`, `upper`, `has`, `floor`) must resolve to the *same*
-        // implementation, so results are identical for the same operation.
+    fn universal_member_ops_have_one_implementation() {
+        // A core-type member call and the bare builtin are the *same* universal
+        // name reaching the *same* implementation — no separate `Type.method`
+        // surface, no proxy. A member call is just `invoke(name, [recv, ..args])`.
         let list = varr(vec![vi64(1), vi64(2), vi64(3)]);
-        assert_eq!(
-            invoke("List.contains", &[list.clone(), vi64(2)]).unwrap().as_bool(),
-            invoke("contains", &[list.clone(), vi64(2)]).unwrap().as_bool(),
-        );
-        // Regression: `List.contains` used to compare by stringification; it now
-        // shares the builtin's value equality, so an int matches by value.
-        assert!(invoke("List.contains", &[list, vi64(2)]).unwrap().as_bool());
+        assert!(invoke("contains", &[list.clone(), vi64(2)]).unwrap().as_bool());
+        assert_eq!(invoke("upper", &[vstr("abc".into())]).unwrap().as_string(), "ABC");
 
-        assert_eq!(
-            invoke("String.toUpperCase", &[vstr("abc".into())]).unwrap().as_string(),
-            invoke("upper", &[vstr("abc".into())]).unwrap().as_string(),
-        );
+        // `reversed` copies (non-mutating), unlike the in-place `reverse`.
+        let src = varr(vec![vi64(1), vi64(2), vi64(3)]);
+        let rev = invoke("reversed", &[src.clone()]).unwrap();
+        assert_eq!(rev.as_array().borrow().data[0].as_i64(), 3);
+        assert_eq!(src.as_array().borrow().data[0].as_i64(), 1, "receiver untouched");
 
+        // `extend` appends in place and returns null; `removeAt`/`insert`/`clear`.
+        let xs = varr(vec![vi64(1)]);
+        invoke("pushAll", &[xs.clone(), varr(vec![vi64(2), vi64(3)])]).unwrap();
+        assert_eq!(invoke("len", &[xs.clone()]).unwrap().as_i64(), 3);
+        invoke("insert", &[xs.clone(), vi64(0), vi64(9)]).unwrap();
+        assert_eq!(xs.as_array().borrow().data[0].as_i64(), 9);
+        assert_eq!(invoke("removeAt", &[xs.clone(), vi64(0)]).unwrap().as_i64(), 9);
+        invoke("clear", &[xs.clone()]).unwrap();
+        assert_eq!(invoke("len", &[xs]).unwrap().as_i64(), 0);
+
+        // `abs` preserves the numeric kind (a double stays a double).
+        assert_eq!(invoke("abs", &[vi64(-7)]).unwrap().typ, 3);
+        assert_eq!(invoke("abs", &[vf64(-3.0)]).unwrap().typ, 5);
+        assert_eq!(invoke("abs", &[vf64(-3.0)]).unwrap().as_f64(), 3.0);
+
+        // num members: `toDouble`, `toString` (Dart-style), `toStringAsFixed`.
+        assert_eq!(invoke("toDouble", &[vi64(4)]).unwrap().typ, 5);
+        assert_eq!(invoke("toString", &[vf64(3.0)]).unwrap().as_string(), "3.0");
+        assert_eq!(invoke("toString", &[vi64(3)]).unwrap().as_string(), "3");
+        assert_eq!(invoke("toStringAsFixed", &[vf64(3.14159), vi64(2)]).unwrap().as_string(), "3.14");
+
+        // map members: `remove` returns the removed value; `putIfAbsent`.
         let map = vobj(-2, {
             let mut m = ValMap::default();
             m.insert("k".into(), vi64(9));
             m
         });
-        assert_eq!(
-            invoke("Map.containsKey", &[map.clone(), vstr("k".into())]).unwrap().as_bool(),
-            invoke("has", &[map, vstr("k".into())]).unwrap().as_bool(),
-        );
+        assert_eq!(invoke("remove", &[map.clone(), vstr("k".into())]).unwrap().as_i64(), 9);
+        assert_eq!(invoke("has", &[map.clone(), vstr("k".into())]).unwrap().as_bool(), false);
+        assert_eq!(invoke("putIfAbsent", &[map, vstr("k".into()), vi64(5)]).unwrap().as_i64(), 5);
 
+        // `join`'s separator is optional (defaults to "").
         assert_eq!(
-            invoke("Num.floor", &[vf64(3.7)]).unwrap().as_i64(),
-            invoke("floor", &[vf64(3.7)]).unwrap().as_i64(),
+            invoke("join", &[varr(vec![vi64(1), vi64(2)])]).unwrap().as_string(),
+            "12"
         );
     }
 
