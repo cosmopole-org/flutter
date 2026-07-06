@@ -1,4 +1,4 @@
-//! # elpian-dart
+//! # dart — the optional Dart/Flutter host surface for the Elpian VM
 //!
 //! A Dart/Flutter runtime layer on top of the [Elpian VM](../elpian_vm/). Elpian
 //! is a **no-JIT** AST/bytecode interpreter: it never generates native machine
