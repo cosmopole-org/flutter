@@ -76,11 +76,50 @@ clicks drive `setState` and the Material UI repaints.
 node flutter_test.mjs        # taps +/-, asserts the counter/derived stats update -> FLUTTER APP E2E PASSED
 ```
 
+### Real Skia via CanvasKit — `canvaskit_bridge.js`
+
+The demos above rasterize with a tiny 2D-canvas stand-in. This variant instead
+drives **real Skia** through **CanvasKit** (Skia compiled to WASM — the exact
+renderer Flutter web uses). [`canvaskit_bridge.js`](canvaskit_bridge.js) is a
+**reflective interpreter**: it can construct any CanvasKit object, call any
+static factory or instance method, resolve any enum/constant, and marshal every
+Skia argument shape — all *by name* — so it covers the **entire Skia API with no
+exceptions** (including future symbols). `auditCoverage()` walks the loaded
+`CanvasKit` and asserts every symbol is reachable.
+
+Two entry points: `paintScene(scene)` replays an Elpian widget scene on Skia
+(with **real text layout** via the Paragraph API), and `runProgram(program)`
+executes a raw "Skia program" — the full-power path a guest emits.
+
+- `canvaskit.html` + `canvaskit_test.mjs` — the `flutter.dart` app rasterized by
+  real Skia (interactive), a reflective full-API showcase (gradients, Bézier
+  paths, mask/image-filter blur, `saveLayer`, shaped text), and the coverage
+  audit.
+- `skia_vm.html` + `skia_vm_test.mjs` — **guest bytecode drives Skia directly**:
+  [`skia_guest.dart`](skia_guest.dart) (no widget framework) emits a reflective
+  Skia program over `dart:ui`, and CanvasKit rasterizes it; taps mutate guest
+  state and re-emit.
+
+CanvasKit's runtime (`canvaskit.js` + `canvaskit.wasm`) and a font are not
+checked in; fetch them once:
+
+```sh
+mkdir -p canvaskit && cd canvaskit
+V=0.39.1
+curl -sSL -o canvaskit.js   "https://unpkg.com/canvaskit-wasm@$V/bin/canvaskit.js"
+curl -sSL -o canvaskit.wasm "https://unpkg.com/canvaskit-wasm@$V/bin/canvaskit.wasm"
+cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf font.ttf   # any TTF works
+cd ..
+node canvaskit_test.mjs      # -> CANVASKIT E2E PASSED  (writes canvaskit.png)
+node skia_vm_test.mjs        # -> SKIA-VM E2E PASSED    (writes skia_vm.png)
+```
+
 ## Honest scope
 
-This is the **Elpian renderer**, not Flutter's CanvasKit/WebGL engine. It proves
-*dynamic Dart → VM-in-browser → pixels* for the subset the VM supports. It is
-**not** "the Flutter web build" (that is Google's `dart2js`/`dart2wasm` +
-CanvasKit pipeline and is unrelated to this VM). The canvas rasterizer here
-stands in for the native engine binding, which is the remaining integration to
-run the full framework.
+The 2D-canvas demos are a **stand-in** rasterizer; the CanvasKit variant is the
+**real** one — genuine Skia, the same engine Flutter web ships, driven by the
+Elpian VM's output (and, in `skia_vm`, by raw guest ops). What this is *not* is
+Google's `dart2js`/`dart2wasm` Flutter-web build; here the Elpian VM (not the
+Dart VM) runs the app, and the bridge — not Flutter's engine glue — connects it
+to CanvasKit. On native (iOS/Android/desktop) the same scene/program contract
+would target native Skia/Impeller via the engine C++ layer instead.

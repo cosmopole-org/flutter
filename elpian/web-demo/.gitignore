@@ -3,3 +3,7 @@
 /interactive.png
 /widgets.png
 /flutter.png
+/canvaskit.png
+/skia_vm.png
+# Vendored CanvasKit runtime + a bundled font (fetched at setup; see README)
+/canvaskit/
