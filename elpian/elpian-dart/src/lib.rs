@@ -50,12 +50,9 @@ pub mod sha256;
 pub mod scene_diff;
 pub mod runtime;
 pub mod typed_data;
-pub mod types;
-pub mod value;
 pub mod wasm_api;
 pub mod widgets;
 
 pub use core::Clock;
 pub use governance::{DartCapability, DartCapabilitySet, ResourceMeter};
 pub use runtime::{DartError, DartRuntime};
-pub use value::DartNum;
