@@ -20,19 +20,21 @@ use crate::parser::Parser;
 /// opcodes emitted directly by [`Emitter::emit_expr`], so no helper functions
 /// are needed.
 const PRELUDE: &str = concat!(
-    "function __List_map(f){ var out = []; var i = 0; while (i < this.length) { out.add(f(this[i])); i = i + 1; } return out; }\n",
-    "function __List_where(f){ var out = []; var i = 0; while (i < this.length) { if (f(this[i])) { out.add(this[i]); } i = i + 1; } return out; }\n",
+    "function __List_map(f){ var out = []; var i = 0; while (i < this.length) { out.push(f(this[i])); i = i + 1; } return out; }\n",
+    "function __List_where(f){ var out = []; var i = 0; while (i < this.length) { if (f(this[i])) { out.push(this[i]); } i = i + 1; } return out; }\n",
     "function __List_forEach(f){ var i = 0; while (i < this.length) { f(this[i]); i = i + 1; } return null; }\n",
     "function __List_fold(init, f){ var acc = init; var i = 0; while (i < this.length) { acc = f(acc, this[i]); i = i + 1; } return acc; }\n",
     "function __List_any(f){ var i = 0; while (i < this.length) { if (f(this[i])) { return true; } i = i + 1; } return false; }\n",
     "function __List_every(f){ var i = 0; while (i < this.length) { if (!f(this[i])) { return false; } i = i + 1; } return true; }\n",
     "function __List_reduce(f){ var acc = this[0]; var i = 1; while (i < this.length) { acc = f(acc, this[i]); i = i + 1; } return acc; }\n",
     // ---- async/await runtime: Future + microtask-driven continuations -------
+    // These helpers are raw Elpian-JS (they bypass the Dart emitter), so they are
+    // written directly against the VM's universal names (`push`, not `add`).
     "var __cbReg = [];\n",
-    "function __later(fn){ var id = __cbReg.length; __cbReg.add(fn); askHost(\"dart:async/scheduleMicrotask\", [id]); }\n",
+    "function __later(fn){ var id = __cbReg.length; __cbReg.push(fn); askHost(\"dart:async/scheduleMicrotask\", [id]); }\n",
     "function __dartDispatch(a){ var fn = __cbReg[a[0]]; fn(); }\n",
     "function __schedThen(value, cb, next){ __later(function(){ var r = cb(value); if (r != null && r.__isFuture) { r.then(function(rv){ next.complete(rv); }); } else { next.complete(r); } }); }\n",
-    "class _Future { constructor(){ this.__isFuture = true; this.done = false; this.value = null; this.cbs = []; } then(cb){ var next = new _Future(); if (this.done) { __schedThen(this.value, cb, next); } else { var p = {}; p.cb = cb; p.next = next; this.cbs.add(p); } return next; } complete(v){ if (this.done) { return; } this.done = true; this.value = v; var i = 0; while (i < this.cbs.length) { var p = this.cbs[i]; __schedThen(v, p.cb, p.next); i = i + 1; } } }\n",
+    "class _Future { constructor(){ this.__isFuture = true; this.done = false; this.value = null; this.cbs = []; } then(cb){ var next = new _Future(); if (this.done) { __schedThen(this.value, cb, next); } else { var p = {}; p.cb = cb; p.next = next; this.cbs.push(p); } return next; } complete(v){ if (this.done) { return; } this.done = true; this.value = v; var i = 0; while (i < this.cbs.length) { var p = this.cbs[i]; __schedThen(v, p.cb, p.next); i = i + 1; } } }\n",
     "function __Future_value(v){ var f = new _Future(); __later(function(){ f.complete(v); }); return f; }\n",
     "function __await(x){ if (x != null && x.__isFuture) { return x; } return __Future_value(x); }\n",
 );
@@ -57,8 +59,43 @@ pub(crate) struct Emitter {
     /// read as a bare member `obj.name` → `obj.name()`. Excludes names that are
     /// also fields somewhere, or native properties, to avoid mis-calling those.
     getters: NameSet,
+    /// Every member name declared by a user class (fields, `this.` params,
+    /// methods, getters). A Dart core-member spelling that collides with one of
+    /// these is left untranslated, so a user's own `add`/`remove`/… method still
+    /// resolves against its object rather than being rewritten to a builtin.
+    user_members: NameSet,
     locals: Vec<NameSet>,
     in_class: bool,
+}
+
+/// Compile-time resolution of a Dart core-type member spelling to the VM's
+/// single **universal** stdlib name. This is the whole point of doing name
+/// resolution in the compiler: the VM never sees `toUpperCase`/`add`/`containsKey`
+/// — it only ever sees `upper`/`push`/`has`. Names that Dart already spells the
+/// universal way (`contains`, `indexOf`, `insert`, `floor`, `keys`, `map`, …) are
+/// not listed here because no translation is needed. Returns the universal name,
+/// or `None` when the spelling needs no change.
+fn universal_member(name: &str) -> Option<&'static str> {
+    Some(match name {
+        // List
+        "add" => "push",
+        "addAll" => "pushAll",
+        "removeLast" => "pop",
+        "sublist" => "slice",
+        // String
+        "toUpperCase" => "upper",
+        "toLowerCase" => "lower",
+        "replaceAll" => "replace",
+        "padLeft" => "padStart",
+        "padRight" => "padEnd",
+        "trimLeft" => "trimStart",
+        "trimRight" => "trimEnd",
+        // num
+        "toInt" => "int",
+        // Map
+        "containsKey" => "has",
+        _ => return None,
+    })
 }
 
 /// Native member names the VM binds as properties (not zero-arg getters), which
@@ -79,6 +116,7 @@ impl Emitter {
             fields: Default::default(),
             methods: Default::default(),
             getters: Default::default(),
+            user_members: Default::default(),
             locals: Vec::new(),
             in_class: false,
         }
@@ -113,11 +151,14 @@ impl Emitter {
                 }
                 for (n, _) in &c.fields {
                     all_fields.insert(n.clone());
+                    self.user_members.insert(n.clone());
                 }
                 for p in c.ctor_params.all_this_params() {
                     all_fields.insert(p.name.clone());
+                    self.user_members.insert(p.name.clone());
                 }
                 for m in &c.methods {
+                    self.user_members.insert(m.name.clone());
                     if m.is_getter && !m.is_static {
                         all_getters.insert(m.name.clone());
                     }
@@ -504,6 +545,18 @@ impl Emitter {
         }
     }
 
+    /// Map a Dart member spelling to the VM's universal stdlib name at compile
+    /// time. A name a user class declares (field/method/getter) addresses that
+    /// object and is never rewritten, so a user's own `add`/`remove`/… still
+    /// resolves against its instance rather than a core-type builtin.
+    fn resolve_member<'a>(&self, name: &'a str) -> &'a str {
+        if self.user_members.contains(name) {
+            name
+        } else {
+            universal_member(name).unwrap_or(name)
+        }
+    }
+
     fn emit_expr(&mut self, e: &Expr) -> String {
         match e {
             Expr::Int(i) => i.to_string(),
@@ -550,12 +603,13 @@ impl Emitter {
             Expr::Index(a, i) => format!("{}[{}]", self.emit_expr(a), self.emit_expr(i)),
             Expr::Member(obj, name) => {
                 let o = self.emit_expr(obj);
+                let resolved = self.resolve_member(name);
                 // A numeric-literal receiver needs parens: `7.clamp` would lex as
                 // the float `7.` followed by `clamp`.
                 let base = if matches!(&**obj, Expr::Int(_) | Expr::Double(_)) {
-                    format!("({o}).{name}")
+                    format!("({o}).{resolved}")
                 } else {
-                    format!("{o}.{name}")
+                    format!("{o}.{resolved}")
                 };
                 // A bare read of a getter invokes it (`obj.x` -> `obj.x()`).
                 if self.getters.contains(name) {
@@ -646,7 +700,7 @@ impl Emitter {
                     } else {
                         o
                     };
-                    return format!("{}.{}({})", recv, name, a.join(", "));
+                    return format!("{}.{}({})", recv, self.resolve_member(name), a.join(", "));
                 }
                 let c = self.emit_expr(callee);
                 format!("{}({})", c, a.join(", "))

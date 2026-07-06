@@ -182,3 +182,34 @@ fn for_loop_no_update_with_continue() {
     // sum 1..6 = 21 minus 3 = 18
     assert_eq!(run("t29", js), "18");
 }
+
+#[test]
+fn js_member_spellings_resolve_to_universal_names_at_compile_time() {
+    // Real JS core-type member spellings are mapped to the VM's universal stdlib
+    // names by js2elpian at compile time — the VM only ever sees the universal
+    // name. `arr.push`/`arr.pop` are already universal; `includes`/`toUpperCase`/
+    // `charCodeAt` diverge and are translated (`contains`/`upper`/`codeUnitAt`).
+    let js = "
+        function f(){
+            let a = [1, 2, 3];
+            a.push(4);
+            let hit = a.includes(4) ? 100 : 0;
+            let s = \"hi\".toUpperCase();
+            let code = s.charCodeAt(0);      // 'H' = 72
+            return hit + a.length + code;    // 100 + 4 + 72 = 176
+        }";
+    assert_eq!(run("js-universal-members", js), "176");
+}
+
+#[test]
+fn user_method_named_like_a_js_builtin_is_not_rewritten() {
+    // A class method whose name collides with a JS core spelling (`includes`)
+    // still dispatches to the user's method, not the universal `contains`.
+    let js = "
+        class Bag {
+            constructor() { this.n = 7; }
+            includes(x) { return this.n + x; }
+        }
+        function f(){ let b = new Bag(); return b.includes(5); }";  // 7 + 5 = 12
+    assert_eq!(run("js-user-includes", js), "12");
+}
