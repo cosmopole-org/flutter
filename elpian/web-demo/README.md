@@ -8,7 +8,7 @@ Pipeline: `app.dart` → Elpian VM (compiled to `wasm32`, no wasm-bindgen) →
 `dart:ui` scene tree → HTML canvas rasterizer → Playwright pixel assertions.
 
 ```
- app.dart ──▶ elpian_dart.wasm (VM) ──askHost("dart:ui/...")──▶ scene tree JSON
+ app.dart ──▶ dart.wasm (VM) ──askHost("dart:ui/...")──▶ scene tree JSON
                                                                       │
                           Playwright (headless Chromium) ◀── canvas ◀─┘
                           asserts red/green/blue swatches + await-driven circle
@@ -26,8 +26,8 @@ paints via the `dart:ui` bridge.
 ```sh
 # 1. Build the VM to wasm and copy it here
 cd elpian
-cargo build -p elpian-dart --target wasm32-unknown-unknown --release
-cp target/wasm32-unknown-unknown/release/elpian_dart.wasm web-demo/
+cargo build -p dart --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/dart.wasm web-demo/
 
 # 2. Run the headless end-to-end test (serves the dir, drives Chromium, asserts pixels)
 cd web-demo
@@ -65,7 +65,7 @@ node widgets_test.mjs        # taps the widget button, asserts the bar tracks st
 
 ### Full `flutter.dart` app variant
 
-`flutter.html` + `flutter_test.mjs` run [`demo_app.dart`](../elpian-dart/flutter/demo_app.dart)
+`flutter.html` + `flutter_test.mjs` run [`demo_app.dart`](../dart/flutter/demo_app.dart)
 — a realistic app that `import 'flutter.dart'` (the full idiomatic widget
 library) and builds a `MaterialApp` → `Scaffold` → `AppBar` with a counter
 `Card`, `+`/`-` `ElevatedButton`s, a progress bar, and stat chips. The library

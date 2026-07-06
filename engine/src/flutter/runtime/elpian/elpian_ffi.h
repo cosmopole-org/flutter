@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-// C ABI of the Elpian VM (Rust crate `elpian-dart`, built as a staticlib and
+// C ABI of the Elpian VM (Rust crate `dart`, built as a staticlib and
 // linked into the engine). These are the same `#[no_mangle] extern "C"` symbols
 // the wasm/browser build exposes, so the *runtime* the engine embeds is exactly
 // the one covered by the crate's test suite — the C++ here is only glue.

@@ -95,9 +95,9 @@ fn tokenize_js(src: &str) -> Vec<JsTok> {
     // Longest punctuators first so the greedy scan never splits `===` into
     // `==` + `=`, `<=` into `<` + `=`, and so on.
     let puncts: &[&str] = &[
-        "===", "!==", "**", "==", "!=", "<=", ">=", "=>", "&&", "||", "++", "--", "+=", "-=", "*=",
-        "/=", "%=", "(", ")", "{", "}", "[", "]", ";", ",", ".", ":", "?", "<", ">", "=", "+", "-",
-        "*", "/", "%", "!", "^", "&", "|",
+        "===", "!==", "**", "~/", "??", "==", "!=", "<=", ">=", "=>", "&&", "||", "++", "--", "+=",
+        "-=", "*=", "/=", "%=", "(", ")", "{", "}", "[", "]", ";", ",", ".", ":", "?", "<", ">", "=",
+        "+", "-", "*", "/", "%", "!", "^", "&", "|",
     ];
     while i < n {
         let c = chars[i];
@@ -623,6 +623,10 @@ impl JsParser {
         //    references it as an ordinary local. A `__proto_<Class>` object maps
         //    each method name to its function, with `__parent` linking the chain.
         let mut proto_map = serde_json::Map::new();
+        // The class name is stamped on the prototype so the native reified
+        // type-test opcode (`is`/`as`) can identify an instance by walking its
+        // `__proto` → `__parent` chain, no external class table required.
+        proto_map.insert("__class_name".to_string(), js_string(&name));
         if let Some(p) = &parent {
             proto_map.insert("__parent".to_string(), js_ident(&format!("__proto_{}", p)));
         } else {
@@ -956,7 +960,7 @@ impl JsParser {
     /// The conditional operator sits below everything else and is
     /// right-associative: `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`.
     fn parse_ternary(&mut self) -> Value {
-        let cond = self.parse_logical_or();
+        let cond = self.parse_nullish();
         if self.eat_punct("?") {
             let consequent = self.parse_ternary();
             self.expect_punct(":");
@@ -964,6 +968,19 @@ impl JsParser {
             return js_ternary(cond, consequent, alternate);
         }
         cond
+    }
+
+    /// `??` (null-coalescing) — lower precedence than `||`, above the ternary;
+    /// left-associative. Lowers to the short-circuiting `logical` node so the
+    /// right operand is only evaluated when the left is null.
+    fn parse_nullish(&mut self) -> Value {
+        let mut left = self.parse_logical_or();
+        while self.at_punct("??") {
+            self.advance();
+            let right = self.parse_logical_or();
+            left = js_logical("??", left, right);
+        }
+        left
     }
 
     /// `||` — lower precedence than `&&`; left-associative.
@@ -995,6 +1012,9 @@ impl JsParser {
             "**" => Some((7, "^", true)),
             "*" => Some((6, "*", false)),
             "/" => Some((6, "/", false)),
+            // Dart truncating integer division. Shares the multiplicative
+            // precedence and lowers to the native `~/` VM opcode (via `js_arith`).
+            "~/" => Some((6, "~/", false)),
             "%" => Some((6, "%", false)),
             "+" => Some((5, "+", false)),
             "-" => Some((5, "-", false)),
@@ -1097,12 +1117,37 @@ impl JsParser {
                 e = json!({ "type": "indexer", "data": { "target": e, "index": idx } });
             } else if self.at_punct("(") {
                 let args = self.parse_args();
-                e = json!({ "type": "functionCall", "data": { "callee": e, "args": args } });
+                // Reified type tests are compiler intrinsics: `__isType(x, "T")`
+                // and `__asType(x, "T")` lower to the native VM type-test opcode
+                // (a `typeTest` AST node), not a guest call or a host round-trip.
+                // The type name is a string literal produced by the front-end.
+                e = Self::type_test_intrinsic(&e, &args)
+                    .unwrap_or_else(|| json!({ "type": "functionCall", "data": { "callee": e, "args": args } }));
             } else {
                 break;
             }
         }
         e
+    }
+
+    /// Recognise the `__isType` / `__asType` intrinsics and lower them to a
+    /// `typeTest` node (`is` when `cast` is false, `as` when true). Returns `None`
+    /// for any other call so it stays an ordinary `functionCall`.
+    fn type_test_intrinsic(callee: &Value, args: &[Value]) -> Option<Value> {
+        if callee["type"] != "identifier" || args.len() != 2 {
+            return None;
+        }
+        let cast = match callee["data"]["name"].as_str()? {
+            "__isType" => false,
+            "__asType" => true,
+            _ => return None,
+        };
+        if args[1]["type"] != "string" {
+            return None;
+        }
+        let type_name = args[1]["data"]["value"].as_str()?;
+        Some(json!({ "type": "typeTest", "data": {
+            "value": args[0].clone(), "typeName": type_name, "cast": cast } }))
     }
 
     fn parse_args(&mut self) -> Vec<Value> {

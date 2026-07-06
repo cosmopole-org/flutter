@@ -6,7 +6,7 @@ use crate::sdk::{
     data::{Array, Function, Object, Payload, Val, ValGroup, ValMap},
     lifecycle::ExecControl,
     limits::{Governor, ResourceLimits},
-    program::{DecodedProgram, UnitKind},
+    program::{DecodedProgram, LogicalKind, UnitKind},
     stdlib,
     type_methods::{self, CoreType, Dispatch},
 };
@@ -31,6 +31,7 @@ pub enum OperationTypes {
     ArrExpr,
     CondBrch,
     CastOprt,
+    TypeTest,
     Logical,
     Conditional,
     Dummy,
@@ -84,6 +85,8 @@ pub enum ExecStates {
     CondBranchFinished,
     CastOprtStarted,
     CastOprtFinished,
+    TypeTestStarted,
+    TypeTestFinished,
     LogicalExtractOp1,
     LogicalExtractOp2,
     CondExprExtractCond,
@@ -1090,25 +1093,171 @@ impl Operation for CastOp {
     }
 }
 
-/// Short-circuiting `&&` / `||`. The left operand is evaluated first; the right
-/// is only evaluated when the result is not already decided (`&&` with a truthy
-/// left, `||` with a falsy left). On short-circuit the dispatch loop reuses the
-/// left value as the result and jumps the program counter to `op2_end`, skipping
-/// the right operand's units entirely. No double evaluation, exact JS semantics.
+/// Reified `is` / `as`. The value expression is evaluated first; the finalizer
+/// then tests it against `type_name` (`cast` false = `is`, yielding a bool;
+/// `cast` true = `as`, yielding the value or trapping on a mismatch). The type
+/// name is folded into the unit at decode, exactly like [`CastOp`]'s target.
+struct TypeTestOp {
+    typ: OperationTypes,
+    state: ExecStates,
+    value: Option<Val>,
+    type_name: String,
+    cast: bool,
+}
+
+impl TypeTestOp {
+    pub fn new(type_name: String, cast: bool) -> Self {
+        TypeTestOp {
+            typ: OperationTypes::TypeTest,
+            state: ExecStates::TypeTestStarted,
+            value: None,
+            type_name,
+            cast,
+        }
+    }
+}
+
+impl Operation for TypeTestOp {
+    fn get_state(&self) -> ExecStates {
+        self.state
+    }
+    fn get_type(&self) -> OperationTypes {
+        self.typ
+    }
+    fn set_state(&mut self, state: ExecStates, data: StateData) {
+        self.state = state;
+        if state == ExecStates::TypeTestFinished {
+            self.value = Some(data.val());
+        }
+    }
+    fn get_data(&self) -> Vec<Val> {
+        vec![
+            self.value.clone().unwrap(),
+            Val { typ: 7, data: Payload::from(self.type_name.clone()) },
+            Val { typ: 6, data: Payload::from(self.cast) },
+        ]
+    }
+}
+
+/// Reified type test: does `value` have (dynamic) type `type_name`? Primitive
+/// type names are matched against the value's type tag; a class name is matched
+/// by walking the instance's prototype chain (`__proto` → `__parent`), each
+/// prototype carrying its `__class_name`, so the class hierarchy embedded in the
+/// value answers the check with no external class table. This is the native
+/// replacement for the `dart:core/isType` host round-trip.
+///
+/// Because the front-ends model an absent value as `0` (no first-class null),
+/// the numeric checks accept that representation just as the previous host
+/// implementation did over the JSON bridge.
+fn value_is_type(value: &Val, type_name: &str) -> bool {
+    match type_name {
+        "dynamic" | "Object" => value.typ != 0,
+        "int" => matches!(value.typ, 1 | 2 | 3),
+        "double" => matches!(value.typ, 4 | 5),
+        "num" => matches!(value.typ, 1..=5),
+        "String" => value.typ == 7,
+        "bool" => value.typ == 6,
+        "List" => value.typ == 9,
+        "Map" => value.typ == 8,
+        "Function" => value.typ == 10,
+        "Null" => value.typ == 0,
+        class => {
+            if value.typ != 8 {
+                return false;
+            }
+            // Walk the prototype chain, comparing each level's class name. Both the
+            // js2elpian/dart2elpian `__proto`→`__parent` prototype scheme and the
+            // stdlib `class`/`new` `__class`→`__parent` scheme are handled: each
+            // prototype/class carries a `__class_name` string.
+            let mut cur = {
+                let inst = value.as_object();
+                let b = inst.borrow();
+                b.data
+                    .data
+                    .get("__proto")
+                    .or_else(|| b.data.data.get("__class"))
+                    .cloned()
+            };
+            // A directly-tagged instance (`__class_name` on the object itself).
+            if let Some(name) = value.as_object().borrow().data.data.get("__class_name") {
+                if name.typ == 7 && name.as_string() == class {
+                    return true;
+                }
+            }
+            while let Some(proto) = cur {
+                if proto.typ != 8 {
+                    break;
+                }
+                let b = proto.as_object();
+                let bref = b.borrow();
+                if let Some(name) = bref.data.data.get("__class_name") {
+                    if name.typ == 7 && name.as_string() == class {
+                        return true;
+                    }
+                }
+                cur = bref.data.data.get("__parent").cloned();
+            }
+            false
+        }
+    }
+}
+
+/// Whether a value is "null" for the purposes of the null-coalescing `??`
+/// operator. The front-ends (js2elpian / dart2elpian) currently have **no
+/// distinct null literal** and model an absent value as the integer `0` (see
+/// js2elpian's `null`/`undefined` lowering), so the runtime notion of null is
+/// the real `Payload::Null` (type tag 0) *or* a numeric zero. This exactly
+/// reproduces the semantics of the front-end `__ifNull` helper this native
+/// operator replaced (`a != null ? a : b`, with `null` compiled to `0`). When
+/// the VM gains a first-class null value this predicate narrows to `typ == 0`.
+fn is_nullish(v: &Val) -> bool {
+    match v.typ {
+        0 => true,
+        1 => v.as_i16() == 0,
+        2 => v.as_i32() == 0,
+        3 => v.as_i64() == 0,
+        4 => v.as_f32() == 0.0,
+        5 => v.as_f64() == 0.0,
+        _ => false,
+    }
+}
+
+/// Short-circuiting `&&` / `||` / `??`. The left operand is evaluated first; the
+/// right is only evaluated when the result is not already decided (`&&` with a
+/// truthy left, `||` with a falsy left, `??` with a non-null left). On
+/// short-circuit the dispatch loop reuses the left value as the result and jumps
+/// the program counter to `op2_end`, skipping the right operand's units entirely.
+/// No double evaluation, exact JS / Dart semantics.
 struct LogicalOp {
     typ: OperationTypes,
     state: ExecStates,
-    is_or: bool,
+    kind: LogicalKind,
     op2_end: usize,
 }
 
 impl LogicalOp {
-    pub fn new(is_or: bool, op2_end: usize) -> Self {
+    pub fn new(kind: LogicalKind, op2_end: usize) -> Self {
         LogicalOp {
             typ: OperationTypes::Logical,
             state: ExecStates::LogicalExtractOp1,
-            is_or,
+            kind,
             op2_end,
+        }
+    }
+    /// The kind re-encoded as the small integer the flag byte uses (`0`=`&&`,
+    /// `1`=`||`, `2`=`??`), so it can travel through `get_data`'s `Val` list.
+    fn kind_tag(kind: LogicalKind) -> i16 {
+        match kind {
+            LogicalKind::And => 0,
+            LogicalKind::Or => 1,
+            LogicalKind::NullCoalesce => 2,
+        }
+    }
+    fn kind_from_tag(tag: i16) -> LogicalKind {
+        match tag {
+            1 => LogicalKind::Or,
+            2 => LogicalKind::NullCoalesce,
+            _ => LogicalKind::And,
         }
     }
 }
@@ -1127,7 +1276,7 @@ impl Operation for LogicalOp {
     }
     fn get_data(&self) -> Vec<Val> {
         vec![
-            Val { typ: 6, data: Payload::from(self.is_or) },
+            Val { typ: 1, data: Payload::from(LogicalOp::kind_tag(self.kind)) },
             Val { typ: 3, data: Payload::from(self.op2_end as i64) },
         ]
     }
@@ -2808,6 +2957,29 @@ impl Executor {
             }
         }
     }
+    /// Dart truncating integer division `a ~/ b`: the quotient truncated toward
+    /// zero, always an `int`. Both operands are coerced to `f64` (so mixed
+    /// int/double operands work, matching Dart's `num ~/ num`), divided, and the
+    /// result is truncated and re-tagged as the compact integer for its
+    /// magnitude. Division by zero traps, as it does in Dart (`~/ 0` throws
+    /// `UnsupportedError`/`IntegerDivisionByZeroException`).
+    fn operate_trunc_division(&self, arg1: Val, arg2: Val) -> Val {
+        let coerce = |v: &Val| -> f64 {
+            match v.typ {
+                1 => v.as_i16() as f64,
+                2 => v.as_i32() as f64,
+                3 => v.as_i64() as f64,
+                4 => v.as_f32() as f64,
+                5 => v.as_f64(),
+                _ => panic!("elpian error: ~/ expects numeric operands"),
+            }
+        };
+        let divisor = coerce(&arg2);
+        if divisor == 0.0 {
+            panic!("elpian error: integer division by zero");
+        }
+        self.check_int_range((coerce(&arg1) / divisor).trunc() as i64)
+    }
     fn operate_modulo(&self, arg1: Val, arg2: Val) -> Val {
         match arg1.typ {
             // Integer dividend: keep an integer remainder for integer divisors,
@@ -4216,18 +4388,39 @@ impl Executor {
                                     == ExecStates::CastOprtFinished;
                             continue;
                         }
+                    } else if op_type == OperationTypes::TypeTest {
+                        if self.registers.last().unwrap().get_state()
+                            == ExecStates::TypeTestStarted
+                        {
+                            // The value just evaluated; the type name + mode are
+                            // already folded into the operation.
+                            self.registers.last_mut().unwrap().set_state(
+                                ExecStates::TypeTestFinished,
+                                StateData::Val(main_reg.take().unwrap()),
+                            );
+                            main_reg = None;
+                            is_reg_state_final =
+                                self.registers.last().unwrap().get_state()
+                                    == ExecStates::TypeTestFinished;
+                            continue;
+                        }
                     } else if op_type == OperationTypes::Logical {
                         let state = self.registers.last().unwrap().get_state();
                         if state == ExecStates::LogicalExtractOp1 {
                             // The left operand just evaluated. Decide whether the
-                            // result is settled (`&&` falsy / `||` truthy → reuse it
-                            // and skip the right operand) or the right operand must
-                            // be evaluated (`&&` truthy / `||` falsy).
+                            // result is settled (reuse the left value and skip the
+                            // right operand) or the right operand must be evaluated:
+                            // `&&` short-circuits on a falsy left, `||` on a truthy
+                            // left, and `??` on a non-null left.
                             let data = self.registers.last().unwrap().get_data();
-                            let is_or = data[0].as_bool();
+                            let kind = LogicalOp::kind_from_tag(data[0].as_i16());
                             let op2_end = data[1].as_i64() as usize;
                             let left = main_reg.take().unwrap();
-                            let evaluate_right = if is_or { !left.truthy() } else { left.truthy() };
+                            let evaluate_right = match kind {
+                                LogicalKind::And => left.truthy(),
+                                LogicalKind::Or => !left.truthy(),
+                                LogicalKind::NullCoalesce => is_nullish(&left),
+                            };
                             if evaluate_right {
                                 self.registers
                                     .last_mut()
@@ -4771,6 +4964,9 @@ impl Executor {
                             12 => {
                                 main_reg = Some(self.operate_power(arg1, arg2));
                             }
+                            13 => {
+                                main_reg = Some(self.operate_trunc_division(arg1, arg2));
+                            }
                             _ => {}
                         }
                         is_reg_state_final = false;
@@ -4948,6 +5144,29 @@ impl Executor {
                             self.pointer = branch_false_start;
                         }
                         self.registers.pop();
+                        is_reg_state_final = false;
+                        continue;
+                    } else if self.registers.last().unwrap().get_state()
+                        == ExecStates::TypeTestFinished
+                    {
+                        let regs = self.registers.last().unwrap().get_data();
+                        let value = regs[0].clone();
+                        let type_name = regs[1].as_string();
+                        let cast = regs[2].as_bool();
+                        self.registers.pop();
+                        let matches = value_is_type(&value, &type_name);
+                        if cast {
+                            // `as`: yield the value on a match, trap on a mismatch —
+                            // Dart's checked-cast semantics.
+                            if matches {
+                                main_reg = Some(value);
+                            } else {
+                                panic!("elpian error: TypeError: value is not a {type_name}");
+                            }
+                        } else {
+                            // `is`: the boolean result of the type test.
+                            main_reg = Some(Val { typ: 6, data: Payload::from(matches) });
+                        }
                         is_reg_state_final = false;
                         continue;
                     } else if self.registers.last().unwrap().get_state()
@@ -5181,8 +5400,8 @@ impl Executor {
                                 }
                             }
                         } else if target_type == "f64" || target_type == "number" {
-                            // `number` is the JavaScript numeric type, aliased onto
-                            // the f64 representation.
+                            // `number` is the VM's unified numeric type name,
+                            // aliased onto the f64 representation.
                             match data.typ {
                                 1 => {
                                     main_reg = Some(Val {
@@ -5454,9 +5673,9 @@ impl Executor {
                 UnitKind::Not => {
                     self.registers.push(Box::new(NotValue::new()));
                 }
-                // short-circuiting logical && / ||
-                UnitKind::Logical { is_or, op2_end } => {
-                    self.registers.push(Box::new(LogicalOp::new(is_or, op2_end)));
+                // short-circuiting logical && / || / ??
+                UnitKind::Logical { kind, op2_end } => {
+                    self.registers.push(Box::new(LogicalOp::new(kind, op2_end)));
                 }
                 // conditional / ternary expression
                 UnitKind::Conditional { alt_start, end } => {
@@ -5465,6 +5684,10 @@ impl Executor {
                 // cast operation (target type folded into the unit)
                 UnitKind::Cast { target_type } => {
                     self.registers.push(Box::new(CastOp::new(target_type.to_string())));
+                }
+                // reified type test `is` / `as` (type name + mode folded in)
+                UnitKind::TypeTest { type_name, cast } => {
+                    self.registers.push(Box::new(TypeTestOp::new(type_name.to_string(), cast)));
                 }
                 // ----------------------------------
                 // program operators:

@@ -269,7 +269,7 @@ impl Val {
             _ => panic!("as_bool on non-bool value (typ {})", self.typ),
         }
     }
-    /// JavaScript truthiness: the value's boolean coercion used by `if`/`while`/
+    /// Truthiness: the value's boolean coercion used by `if`/`while`/
     /// `for` conditions, `!`, `&&`/`||` and the ternary. `null`/`undefined`, the
     /// numeric zeros, an empty string and `false` are falsy; every object, array,
     /// function and non-empty string (and any non-zero number) is truthy.

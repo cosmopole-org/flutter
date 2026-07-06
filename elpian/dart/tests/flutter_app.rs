@@ -1,9 +1,10 @@
+#![cfg(feature = "dart")]
 //! End-to-end test of the imported `flutter.dart` library: the realistic
 //! `demo_app.dart` (MaterialApp/Scaffold/AppBar/Card/Row/Column/ElevatedButton/
 //! StatefulWidget) compiles, lays out, paints a scene, and responds to taps.
 
-use elpian_dart::binding::{PointerEvent, PointerPhase};
-use elpian_dart::{DartCapabilitySet, DartRuntime, ResourceMeter};
+use dart::binding::{PointerEvent, PointerPhase};
+use dart::{DartCapabilitySet, DartRuntime, ResourceMeter};
 use serde_json::Value;
 
 const DEMO: &str = include_str!("../flutter/demo_app.dart");

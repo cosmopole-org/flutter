@@ -4,12 +4,13 @@
 
 import("//flutter/common/config.gni")
 
-# The Elpian VM, built from the Rust crate `elpian-dart` as a static library.
-# Produced out-of-tree by:
-#   cd elpian && cargo build -p elpian-dart --release
-# and staged as libelpian_dart.a. This target links it and exposes the C ABI.
+# The Elpian VM plus the optional Dart/Flutter host surface, built from the Rust
+# crate `dart` as a static library. Produced out-of-tree by:
+#   cd elpian && cargo build -p dart --release            # with the Dart extras
+# and staged as libdart.a. This target links it and exposes the C ABI. Build with
+# `--no-default-features` for a VM-only artifact without the Dart extras.
 config("elpian_vm_config") {
-  libs = [ "elpian_dart" ]
+  libs = [ "dart" ]
   lib_dirs = [ rebase_path("//../../elpian/target/release") ]
 }
 

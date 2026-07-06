@@ -92,6 +92,18 @@ fn serialize_expr(val: serde_json::Value) -> Vec<u8> {
             result.append(&mut i32::to_be_bytes(tt_bytes.len() as i32).to_vec());
             result.append(&mut tt_bytes);
         }
+        "typeTest" => {
+            // Reified `is` / `as`. Layout: [0xed][cast flag][value][type name].
+            // `cast` is 0 for `is` (yields a bool) and 1 for `as` (yields the
+            // value, trapping on a mismatch). The type name is the base type as a
+            // length-prefixed string.
+            result.push(0xed);
+            result.push(if val["data"]["cast"].as_bool().unwrap_or(false) { 1 } else { 0 });
+            result.append(&mut serialize_expr(val["data"]["value"].clone()));
+            let type_bytes = val["data"]["typeName"].as_str().unwrap_or("").as_bytes().to_vec();
+            result.append(&mut i32::to_be_bytes(type_bytes.len() as i32).to_vec());
+            result.append(&mut type_bytes.clone());
+        }
         "object" => {
             result.push(8);
             result.append(&mut i64::to_be_bytes(-2).to_vec());
@@ -122,13 +134,19 @@ fn serialize_expr(val: serde_json::Value) -> Vec<u8> {
             result.append(&mut serialize_expr(val["data"]["value"].clone()));
         }
         "logical" => {
-            // Short-circuit `&&` / `||`. Layout: [0xef][flag][op1][op2], where
-            // `flag` is 0 for `&&` and 1 for `||`. The "skip the right operand"
-            // target is recovered at decode time as a unit index (the unit just
-            // past `op2`), so no byte offsets are baked here.
-            let is_or = val["data"]["operation"].as_str().unwrap() == "||";
+            // Short-circuit `&&` / `||` / `??`. Layout: [0xef][flag][op1][op2],
+            // where `flag` is 0 for `&&`, 1 for `||`, and 2 for the null-coalescing
+            // `??` (Dart / JS): evaluate `op1` and, only if it is null, evaluate
+            // `op2`. The "skip the right operand" target is recovered at decode time
+            // as a unit index (the unit just past `op2`), so no byte offsets are
+            // baked here.
+            let flag = match val["data"]["operation"].as_str().unwrap() {
+                "||" => 1u8,
+                "??" => 2u8,
+                _ => 0u8, // "&&"
+            };
             result.push(0xef);
-            result.push(if is_or { 1 } else { 0 });
+            result.push(flag);
             result.append(&mut serialize_expr(val["data"]["operand1"].clone()));
             result.append(&mut serialize_expr(val["data"]["operand2"].clone()));
         }
@@ -177,6 +195,13 @@ fn serialize_expr(val: serde_json::Value) -> Vec<u8> {
                 }
                 "^" => {
                     result.push(0xfb);
+                }
+                // Dart truncating integer division `~/`: `a ~/ b` computes the
+                // integer quotient truncated toward zero. A native VM opcode (0xfe)
+                // rather than a front-end helper call, so both compilers share the
+                // one implementation.
+                "~/" => {
+                    result.push(0xfe);
                 }
                 _ => {}
             };
@@ -362,7 +387,7 @@ fn collect_used(node: &Value, used: &mut std::collections::BTreeSet<String>) {
             collect_used(&node["data"]["consequent"], used);
             collect_used(&node["data"]["alternate"], used);
         }
-        "not" | "cast" => collect_used(&node["data"]["value"], used),
+        "not" | "cast" | "typeTest" => collect_used(&node["data"]["value"], used),
         "definition" => collect_used(&node["data"]["rightSide"], used),
         "assignment" => {
             collect_used(&node["data"]["leftSide"], used);

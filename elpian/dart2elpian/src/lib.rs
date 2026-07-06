@@ -78,8 +78,9 @@ pub fn transpile(dart: &str) -> Result<String, String> {
     Ok(transpile_program(dart)?.0)
 }
 
-/// A declared class and its optional superclass (for building a runtime
-/// `elpian_dart::types::ClassTable`).
+/// A declared class and its optional superclass. Retained for callers that want
+/// the source-declared hierarchy; the VM itself answers reified `is`/`as`
+/// natively from each instance's prototype chain, so no external table is needed.
 pub type ClassInfo = (String, Option<String>);
 
 /// Transpile and also return the declared class hierarchy, so the runtime can
@@ -116,9 +117,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn erases_types_and_lowers_trunc_div() {
+    fn erases_types_and_emits_native_trunc_div() {
+        // `~/` is a native VM operator now, not a helper call.
         let js = transpile("int x = 7 ~/ 2;").unwrap();
-        assert!(js.contains("var x = __truncDiv(7, 2)"), "got: {js}");
+        assert!(js.contains("var x = (7 ~/ 2)"), "got: {js}");
+        assert!(!js.contains("__truncDiv"), "no helper lowering: {js}");
     }
 
     #[test]
@@ -172,9 +175,23 @@ mod tests {
     }
 
     #[test]
-    fn null_coalescing_lowers_to_helper() {
+    fn is_and_as_emit_native_intrinsics_not_host_calls() {
+        // Reified `is`/`as` lower to the `__isType`/`__asType` compiler intrinsics
+        // (native VM opcode), not a `dart:core/isType` host round-trip. Generics
+        // are erased to the base type name.
+        let js = transpile("var a = x is List<int>; var b = y as Foo;").unwrap();
+        assert!(js.contains("__isType(x, \"List\")"), "is -> intrinsic: {js}");
+        assert!(js.contains("__asType(y, \"Foo\")"), "as -> intrinsic: {js}");
+        assert!(!js.contains("isType\""), "no isType host round-trip: {js}");
+        assert!(!js.contains("asType\""), "no asType host round-trip: {js}");
+    }
+
+    #[test]
+    fn null_coalescing_emits_native_operator() {
+        // `??` is a native short-circuiting VM operator now, not a helper call.
         let js = transpile("var x = a ?? 5;").unwrap();
-        assert!(js.contains("__ifNull("), "?? -> __ifNull: {js}");
+        assert!(js.contains("(a ?? 5)"), "?? -> native operator: {js}");
+        assert!(!js.contains("__ifNull"), "no helper lowering: {js}");
     }
 
     #[test]

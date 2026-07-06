@@ -1,5 +1,11 @@
 //! `Map` methods — the members callable on a map value, grouped by the type
 //! they relate to. Dispatched here from `stdlib::invoke` for any `Map.<m>` call.
+//!
+//! `keys`, `values`, and `containsKey` delegate to the single canonical builtin
+//! implementation (`keys`/`values`/`has`) via the parent `stdlib::invoke`; the
+//! remaining members keep their own logic because they have no builtin
+//! equivalent with matching semantics (`remove` returns the removed value,
+//! `putIfAbsent` inserts-and-returns, `isEmpty`/`isNotEmpty`).
 
 use crate::sdk::data::*;
 use crate::sdk::stdlib::*;
@@ -7,24 +13,12 @@ use crate::sdk::stdlib::*;
 /// Invoke `Map.<method>` on `args[0]` (the receiver) plus trailing arguments.
 pub(crate) fn invoke(name: &str, method: &str, args: &[Val]) -> Result<Val, String> {
     match method {
-        "keys" => {
-            let o = expect_object(name, &args[0])?;
-            let b = o.borrow();
-            let keys: Vec<Val> = b.data.data.keys().map(|k| vstr(k.clone())).collect();
-            Ok(varr(keys))
-        }
-        "values" => {
-            let o = expect_object(name, &args[0])?;
-            let b = o.borrow();
-            let vals: Vec<Val> = b.data.data.values().cloned().collect();
-            Ok(varr(vals))
-        }
-        "containsKey" => {
-            at_least(name, args, 2)?;
-            let o = expect_object(name, &args[0])?;
-            let has = o.borrow().data.data.contains_key(&args[1].as_string());
-            Ok(vbool(has))
-        }
+        // ---- delegated to the single canonical builtin implementation ------
+        "keys" => super::super::invoke("keys", args),
+        "values" => super::super::invoke("values", args),
+        "containsKey" => super::super::invoke("has", args),
+
+        // ---- members unique to the Map surface -----------------------------
         "remove" => {
             at_least(name, args, 2)?;
             let o = expect_object(name, &args[0])?;
@@ -52,6 +46,7 @@ pub(crate) fn invoke(name: &str, method: &str, args: &[Val]) -> Result<Val, Stri
             let empty = o.borrow().data.data.is_empty();
             Ok(vbool(!empty))
         }
+
         _ => Err(format!("unknown builtin '{name}'")),
     }
 }
