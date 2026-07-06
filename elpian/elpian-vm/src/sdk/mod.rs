@@ -7,4 +7,5 @@ pub mod lifecycle;
 pub mod limits;
 pub mod program;
 pub mod stdlib;
+pub mod type_methods;
 pub mod vm;
