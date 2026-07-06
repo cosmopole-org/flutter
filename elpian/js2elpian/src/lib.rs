@@ -95,9 +95,9 @@ fn tokenize_js(src: &str) -> Vec<JsTok> {
     // Longest punctuators first so the greedy scan never splits `===` into
     // `==` + `=`, `<=` into `<` + `=`, and so on.
     let puncts: &[&str] = &[
-        "===", "!==", "**", "==", "!=", "<=", ">=", "=>", "&&", "||", "++", "--", "+=", "-=", "*=",
-        "/=", "%=", "(", ")", "{", "}", "[", "]", ";", ",", ".", ":", "?", "<", ">", "=", "+", "-",
-        "*", "/", "%", "!", "^", "&", "|",
+        "===", "!==", "**", "~/", "??", "==", "!=", "<=", ">=", "=>", "&&", "||", "++", "--", "+=",
+        "-=", "*=", "/=", "%=", "(", ")", "{", "}", "[", "]", ";", ",", ".", ":", "?", "<", ">", "=",
+        "+", "-", "*", "/", "%", "!", "^", "&", "|",
     ];
     while i < n {
         let c = chars[i];
@@ -956,7 +956,7 @@ impl JsParser {
     /// The conditional operator sits below everything else and is
     /// right-associative: `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`.
     fn parse_ternary(&mut self) -> Value {
-        let cond = self.parse_logical_or();
+        let cond = self.parse_nullish();
         if self.eat_punct("?") {
             let consequent = self.parse_ternary();
             self.expect_punct(":");
@@ -964,6 +964,19 @@ impl JsParser {
             return js_ternary(cond, consequent, alternate);
         }
         cond
+    }
+
+    /// `??` (null-coalescing) — lower precedence than `||`, above the ternary;
+    /// left-associative. Lowers to the short-circuiting `logical` node so the
+    /// right operand is only evaluated when the left is null.
+    fn parse_nullish(&mut self) -> Value {
+        let mut left = self.parse_logical_or();
+        while self.at_punct("??") {
+            self.advance();
+            let right = self.parse_logical_or();
+            left = js_logical("??", left, right);
+        }
+        left
     }
 
     /// `||` — lower precedence than `&&`; left-associative.
@@ -995,6 +1008,9 @@ impl JsParser {
             "**" => Some((7, "^", true)),
             "*" => Some((6, "*", false)),
             "/" => Some((6, "/", false)),
+            // Dart truncating integer division. Shares the multiplicative
+            // precedence and lowers to the native `~/` VM opcode (via `js_arith`).
+            "~/" => Some((6, "~/", false)),
             "%" => Some((6, "%", false)),
             "+" => Some((5, "+", false)),
             "-" => Some((5, "-", false)),

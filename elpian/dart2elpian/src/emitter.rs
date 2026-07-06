@@ -9,14 +9,17 @@ use crate::parser::Parser;
 // Emitter (Dart AST -> Elpian JS subset)
 // ---------------------------------------------------------------------------
 
-/// Runtime prelude prepended to every program. `__truncDiv` backs `~/`; the
-/// `__List_*` functions implement the higher-order `Iterable` methods in the
-/// language itself (the VM's indexer binds them to the receiver as `this` when
-/// `list.map`/`.where`/… is read). They rely on `this.length`, `this[i]`,
-/// `out.add(...)`, and closure calls — all VM-supported.
+/// Runtime prelude prepended to every program. The `__List_*` functions
+/// implement the higher-order `Iterable` methods in the language itself (the
+/// VM's indexer binds them to the receiver as `this` when `list.map`/`.where`/…
+/// is read). They rely on `this.length`, `this[i]`, `out.add(...)`, and closure
+/// calls — all VM-supported.
+///
+/// The Dart-specific operators `~/` (truncating integer division) and `??`
+/// (null-coalescing) are **not** in this prelude: they lower to native VM
+/// opcodes emitted directly by [`Emitter::emit_expr`], so no helper functions
+/// are needed.
 const PRELUDE: &str = concat!(
-    "function __truncDiv(a, b){ return (a - (a % b)) / b; }\n",
-    "function __ifNull(a, b){ if (a != null) { return a; } return b; }\n",
     "function __List_map(f){ var out = []; var i = 0; while (i < this.length) { out.add(f(this[i])); i = i + 1; } return out; }\n",
     "function __List_where(f){ var out = []; var i = 0; while (i < this.length) { if (f(this[i])) { out.add(this[i]); } i = i + 1; } return out; }\n",
     "function __List_forEach(f){ var i = 0; while (i < this.length) { f(this[i]); i = i + 1; } return null; }\n",
@@ -532,13 +535,10 @@ impl Emitter {
                 }
             }
             Expr::Binary(op, a, b) => {
-                if op == "~/" {
-                    format!("__truncDiv({}, {})", self.emit_expr(a), self.emit_expr(b))
-                } else if op == "??" {
-                    format!("__ifNull({}, {})", self.emit_expr(a), self.emit_expr(b))
-                } else {
-                    format!("({} {} {})", self.emit_expr(a), op, self.emit_expr(b))
-                }
+                // `~/` and `??` are native VM operators (truncating division and
+                // null-coalescing); every operator, these included, emits as the
+                // shared parenthesised infix form the front-end shares with JS.
+                format!("({} {} {})", self.emit_expr(a), op, self.emit_expr(b))
             }
             Expr::Ternary(c, t, e) => {
                 format!("({} ? {} : {})", self.emit_expr(c), self.emit_expr(t), self.emit_expr(e))

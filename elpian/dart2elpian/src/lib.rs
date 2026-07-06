@@ -116,9 +116,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn erases_types_and_lowers_trunc_div() {
+    fn erases_types_and_emits_native_trunc_div() {
+        // `~/` is a native VM operator now, not a helper call.
         let js = transpile("int x = 7 ~/ 2;").unwrap();
-        assert!(js.contains("var x = __truncDiv(7, 2)"), "got: {js}");
+        assert!(js.contains("var x = (7 ~/ 2)"), "got: {js}");
+        assert!(!js.contains("__truncDiv"), "no helper lowering: {js}");
     }
 
     #[test]
@@ -172,9 +174,11 @@ mod tests {
     }
 
     #[test]
-    fn null_coalescing_lowers_to_helper() {
+    fn null_coalescing_emits_native_operator() {
+        // `??` is a native short-circuiting VM operator now, not a helper call.
         let js = transpile("var x = a ?? 5;").unwrap();
-        assert!(js.contains("__ifNull("), "?? -> __ifNull: {js}");
+        assert!(js.contains("(a ?? 5)"), "?? -> native operator: {js}");
+        assert!(!js.contains("__ifNull"), "no helper lowering: {js}");
     }
 
     #[test]

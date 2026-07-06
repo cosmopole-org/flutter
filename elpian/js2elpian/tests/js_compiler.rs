@@ -475,3 +475,33 @@ fn class_fields_and_independent_instances() {
         }";
     assert_eq!(run_js_and_call("js-class-fields", js, "f"), "311");
 }
+
+// ---- native Dart-flavoured operators lowered to VM opcodes ------------------
+
+#[test]
+fn truncating_integer_division() {
+    // `~/` is a native VM opcode (truncating toward zero, always an int), not a
+    // helper call. 7 ~/ 2 = 3; it composes with `%` at the same precedence.
+    assert_eq!(run_js_and_call("js-tdiv-1", "function f() { return 7 ~/ 2; }", "f"), "3");
+    assert_eq!(run_js_and_call("js-tdiv-2", "function f() { return -7 ~/ 2; }", "f"), "-3");
+    // (0xFF00FF ~/ 0x10000) % 256 — the colour-channel idiom from flutter.dart.
+    assert_eq!(
+        run_js_and_call("js-tdiv-3", "function f() { var v = 16711935; return (v ~/ 65536) % 256; }", "f"),
+        "255",
+    );
+}
+
+#[test]
+fn null_coalescing_operator() {
+    // `??` is a native short-circuiting VM opcode. A null (modelled as 0 by the
+    // front-end) yields the right operand; a present value yields itself.
+    assert_eq!(run_js_and_call("js-nc-1", "function f() { var a = null; return a ?? 5; }", "f"), "5");
+    assert_eq!(run_js_and_call("js-nc-2", "function f() { var a = 9; return a ?? 5; }", "f"), "9");
+    // Short-circuit: the right operand is NOT evaluated when the left is present,
+    // so the side effect on `hit` never runs.
+    let js = "
+        var hit = 0;
+        function side() { hit = 1; return 99; }
+        function f() { var a = 7; var r = a ?? side(); return r * 1000 + hit; }";
+    assert_eq!(run_js_and_call("js-nc-3", js, "f"), "7000");
+}

@@ -122,13 +122,19 @@ fn serialize_expr(val: serde_json::Value) -> Vec<u8> {
             result.append(&mut serialize_expr(val["data"]["value"].clone()));
         }
         "logical" => {
-            // Short-circuit `&&` / `||`. Layout: [0xef][flag][op1][op2], where
-            // `flag` is 0 for `&&` and 1 for `||`. The "skip the right operand"
-            // target is recovered at decode time as a unit index (the unit just
-            // past `op2`), so no byte offsets are baked here.
-            let is_or = val["data"]["operation"].as_str().unwrap() == "||";
+            // Short-circuit `&&` / `||` / `??`. Layout: [0xef][flag][op1][op2],
+            // where `flag` is 0 for `&&`, 1 for `||`, and 2 for the null-coalescing
+            // `??` (Dart / JS): evaluate `op1` and, only if it is null, evaluate
+            // `op2`. The "skip the right operand" target is recovered at decode time
+            // as a unit index (the unit just past `op2`), so no byte offsets are
+            // baked here.
+            let flag = match val["data"]["operation"].as_str().unwrap() {
+                "||" => 1u8,
+                "??" => 2u8,
+                _ => 0u8, // "&&"
+            };
             result.push(0xef);
-            result.push(if is_or { 1 } else { 0 });
+            result.push(flag);
             result.append(&mut serialize_expr(val["data"]["operand1"].clone()));
             result.append(&mut serialize_expr(val["data"]["operand2"].clone()));
         }
@@ -177,6 +183,13 @@ fn serialize_expr(val: serde_json::Value) -> Vec<u8> {
                 }
                 "^" => {
                     result.push(0xfb);
+                }
+                // Dart truncating integer division `~/`: `a ~/ b` computes the
+                // integer quotient truncated toward zero. A native VM opcode (0xfe)
+                // rather than a front-end helper call, so both compilers share the
+                // one implementation.
+                "~/" => {
+                    result.push(0xfe);
                 }
                 _ => {}
             };

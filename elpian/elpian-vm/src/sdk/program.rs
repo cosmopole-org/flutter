@@ -36,6 +36,31 @@ use std::rc::Rc;
 
 use crate::sdk::data::{Payload, Val};
 
+/// The three short-circuiting binary operators the VM lowers through the single
+/// `0xef` opcode, distinguished by the opcode's flag byte. `And`/`Or` are the
+/// JavaScript logical operators; `NullCoalesce` is the Dart / JS `??` — it
+/// yields the left operand unless it is null, in which case it evaluates and
+/// yields the right operand. (Because the front-ends currently model an absent
+/// value as `0`, the executor's null test also treats a numeric zero as null;
+/// see `executor::is_nullish`.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogicalKind {
+    And,
+    Or,
+    NullCoalesce,
+}
+
+impl LogicalKind {
+    /// Decode the opcode flag byte: `0` = `&&`, `1` = `||`, `2` = `??`.
+    fn from_flag(flag: u8) -> LogicalKind {
+        match flag {
+            1 => LogicalKind::Or,
+            2 => LogicalKind::NullCoalesce,
+            _ => LogicalKind::And,
+        }
+    }
+}
+
 /// One decoded operation, with every operand already parsed. Cheap to clone
 /// (scalars are copied; names, parameter lists and case tables are `Rc` pointer
 /// bumps), which the dispatch loop relies on. Every position field is a **unit
@@ -63,10 +88,11 @@ pub enum UnitKind {
     Call { argc: u32 },
     /// `0xfc` — boolean `!`.
     Not,
-    /// `0xef` — short-circuiting logical `&&` (`is_or` false) / `||` (`is_or`
-    /// true). The left operand follows immediately; `op2_end` is the unit index
-    /// just past the right operand, so the executor can skip it on short-circuit.
-    Logical { is_or: bool, op2_end: usize },
+    /// `0xef` — short-circuiting logical operator (`&&`, `||`, or the
+    /// null-coalescing `??`), discriminated by [`LogicalKind`]. The left operand
+    /// follows immediately; `op2_end` is the unit index just past the right
+    /// operand, so the executor can skip it on short-circuit.
+    Logical { kind: LogicalKind, op2_end: usize },
     /// `0xee` — conditional/ternary `c ? a : b`. The condition follows
     /// immediately, then the consequent and alternate. `alt_start` is the unit
     /// index of the alternate; `end` is one past the whole expression.
@@ -337,11 +363,14 @@ impl<'a> Decoder<'a> {
                 // (`op2_end`) is the unit index just past `op2`; since units are
                 // emitted in order, that is simply `units.len()` once `op2` is
                 // decoded — a unit index already, needing no relocation.
-                let idx = self.emit(pos, UnitKind::Logical { is_or: false, op2_end: 0 });
-                let is_or = self.bytes[pos + 1] == 1;
+                let idx = self.emit(
+                    pos,
+                    UnitKind::Logical { kind: LogicalKind::And, op2_end: 0 },
+                );
+                let kind = LogicalKind::from_flag(self.bytes[pos + 1]);
                 let after_op1 = self.decode_value(pos + 2);
                 let after_op2 = self.decode_value(after_op1);
-                self.units[idx] = UnitKind::Logical { is_or, op2_end: self.units.len() };
+                self.units[idx] = UnitKind::Logical { kind, op2_end: self.units.len() };
                 after_op2
             }
             0xee => {
@@ -367,6 +396,14 @@ impl<'a> Decoder<'a> {
             }
             0xf0..=0xfb => {
                 self.emit(pos, UnitKind::Arith((tag - 0xf0 + 1) as i16));
+                let after_op1 = self.decode_value(pos + 1);
+                self.decode_value(after_op1)
+            }
+            0xfe => {
+                // Dart truncating integer division `~/` — arith op id 13. Kept out
+                // of the contiguous `0xf0..=0xfb` block (0xfc/0xfd are `not`/`cast`)
+                // so its id is assigned explicitly rather than by tag arithmetic.
+                self.emit(pos, UnitKind::Arith(13));
                 let after_op1 = self.decode_value(pos + 1);
                 self.decode_value(after_op1)
             }
