@@ -415,7 +415,10 @@ impl DartRuntime {
             "typed_data" => self.typed_data.dispatch(method, args),
             "ui" => self.ui.dispatch(method, args),
             "core" | "math" => self.core.dispatch(library, method, args),
-            "convert" => crate::convert::dispatch(method, args),
+            // `dart:convert` (JSON/UTF-8/Base64) is a pure codec now provided
+            // natively by the VM stdlib (`jsonParse`/`jsonStringify`/`utf8Encode`/
+            // `utf8Decode`/`base64Encode`/`base64Decode`), so it no longer needs a
+            // host-bridge service here.
             "async" => self.dispatch_async(method, args),
             "isolate" => self.dispatch_isolate(method, args),
             other => Err(format!("unimplemented library dart:{other} (method {method})")),

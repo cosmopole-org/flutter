@@ -205,8 +205,9 @@ pub const BUILTINS: &[&str] = &[
     "asinh", "acosh", "atanh", "degrees", "radians", "isNaN", "isFinite", "factorial",
     // math — binary / variadic
     "pow", "log", "atan2", "hypot", "min", "max", "clamp", "gcd", "lcm", "sum", "mean",
-    // foundation — reflection / conversion
+    // foundation — reflection / conversion + codecs
     "typeOf", "len", "str", "num", "int", "bool", "isNull", "jsonParse", "jsonStringify",
+    "base64Encode", "base64Decode", "utf8Encode", "utf8Decode",
     // foundation — object
     "keys", "values", "entries", "has", "get", "setKey", "delKey", "merge", "__setIndex",
     // foundation — array
@@ -439,6 +440,30 @@ pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
         "jsonStringify" => {
             arity(name, args, 1)?;
             Ok(vstr(val_to_json(&args[0]).to_string()))
+        }
+        // Pure, deterministic byte codecs — the `dart:convert` UTF-8 / Base64
+        // surface, provided natively in-process rather than over the host seam.
+        // A byte list is a VM array of integers in 0..=255.
+        "utf8Encode" => {
+            arity(name, args, 1)?;
+            let s = expect_string(name, &args[0])?;
+            Ok(varr(s.into_bytes().into_iter().map(|b| vi64(b as i64)).collect()))
+        }
+        "utf8Decode" => {
+            arity(name, args, 1)?;
+            let bytes = expect_bytes(name, &args[0])?;
+            String::from_utf8(bytes)
+                .map(vstr)
+                .map_err(|_| format!("{name}: invalid UTF-8"))
+        }
+        "base64Encode" => {
+            arity(name, args, 1)?;
+            Ok(vstr(base64_encode(&expect_bytes(name, &args[0])?)))
+        }
+        "base64Decode" => {
+            arity(name, args, 1)?;
+            let s = expect_string(name, &args[0])?;
+            base64_decode(&s).map(|bytes| varr(bytes.into_iter().map(|b| vi64(b as i64)).collect()))
         }
 
         // ---- foundation: object --------------------------------------------
@@ -956,6 +981,59 @@ pub(crate) fn expect_string(name: &str, v: &Val) -> Result<String, String> {
         Err(format!("{name} expects a string, got {}", type_name(v)))
     }
 }
+/// Read a byte list (a VM array of integers, each taken mod 256) for the codec
+/// builtins.
+pub(crate) fn expect_bytes(name: &str, v: &Val) -> Result<Vec<u8>, String> {
+    let a = expect_array(name, v)?;
+    let b = a.borrow();
+    let mut out = Vec::with_capacity(b.data.len());
+    for item in b.data.iter() {
+        out.push(as_int(item)? as u8);
+    }
+    Ok(out)
+}
+
+// ----------------------------------------------------------------------------
+// Base64 (RFC 4648) — a pure, self-contained codec for the `base64Encode` /
+// `base64Decode` builtins.
+// ----------------------------------------------------------------------------
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub(crate) fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        out.push(B64[((n >> 18) & 63) as usize] as char);
+        out.push(B64[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { B64[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { B64[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+pub(crate) fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let inv = |c: u8| -> Option<u32> { B64.iter().position(|&x| x == c).map(|p| p as u32) };
+    let clean: Vec<u8> = s.bytes().filter(|&c| c != b'=' && !c.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
+    for chunk in clean.chunks(4) {
+        let mut n = 0u32;
+        let mut bits = 0;
+        for &c in chunk {
+            let v = inv(c).ok_or_else(|| format!("invalid base64 char '{}'", c as char))?;
+            n = (n << 6) | v;
+            bits += 6;
+        }
+        let bytes = bits / 8;
+        n <<= (4 - chunk.len()) as u32 * 6;
+        let be = n.to_be_bytes(); // n occupies the low 24 bits
+        for i in 0..bytes {
+            out.push(be[1 + i]);
+        }
+    }
+    Ok(out)
+}
 
 /// String form of a scalar/compound for joining and concatenation.
 pub(crate) fn str_of(v: &Val) -> String {
@@ -1373,6 +1451,33 @@ mod tests {
         invoke("push", &[a_tags, vi64(1)]).unwrap();
         let b_tags = invoke("field", &[b, vstr("tags".into())]).unwrap();
         assert_eq!(b_tags.as_array().borrow().data.len(), 0, "instance b unaffected");
+    }
+
+    #[test]
+    fn byte_codecs_roundtrip() {
+        // UTF-8: 'h' = 0x68, 'é' = 0xC3 0xA9.
+        let bytes = invoke("utf8Encode", &[vstr("hé".into())]).unwrap();
+        let b = bytes.as_array();
+        assert_eq!(
+            b.borrow().data.iter().map(|v| v.as_i64()).collect::<Vec<_>>(),
+            vec![0x68, 0xC3, 0xA9]
+        );
+        assert_eq!(invoke("utf8Decode", &[bytes]).unwrap().as_string(), "hé");
+
+        // Base64 RFC 4648 vectors, including padding.
+        assert_eq!(
+            invoke("base64Encode", &[varr(vec![vi64(77), vi64(97), vi64(110)])]).unwrap().as_string(),
+            "TWFu"
+        );
+        assert_eq!(
+            invoke("base64Encode", &[varr(vec![vi64(77)])]).unwrap().as_string(),
+            "TQ=="
+        );
+        let dec = invoke("base64Decode", &[vstr("TWFu".into())]).unwrap();
+        assert_eq!(
+            dec.as_array().borrow().data.iter().map(|v| v.as_i64()).collect::<Vec<_>>(),
+            vec![77, 97, 110]
+        );
     }
 
     #[test]
