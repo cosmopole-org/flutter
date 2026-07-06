@@ -1,0 +1,117 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Elpian VM → CanvasKit (real Skia)</title>
+  <style>
+    body { background: #0b0d14; color: #cbd5e1; font-family: system-ui, sans-serif; margin: 16px; }
+    canvas { border: 1px solid #2a2e3e; border-radius: 8px; background: #12141c; }
+    .row { display: flex; gap: 24px; align-items: flex-start; }
+    code { color: #7dd3fc; }
+  </style>
+</head>
+<body>
+  <h3>The <code>flutter.dart</code> app, rasterized by <b>real CanvasKit / Skia</b> — plus a full-API Skia showcase driven reflectively.</h3>
+  <div class="row">
+    <div><div>Elpian app → Skia</div><canvas id="app" width="400" height="800"></canvas></div>
+    <div><div>Reflective full-Skia showcase</div><canvas id="showcase" width="400" height="320"></canvas></div>
+  </div>
+  <script src="canvaskit/canvaskit.js"></script>
+  <script type="module">
+    import { SkiaBridge, auditCoverage } from './canvaskit_bridge.js';
+
+    async function main() {
+      const CanvasKit = await window.CanvasKitInit({ locateFile: (f) => 'canvaskit/' + f });
+      window.__ck = CanvasKit;
+      const fontBytes = new Uint8Array(await fetch('canvaskit/font.ttf').then((r) => r.arrayBuffer()));
+
+      // ---- 1. Coverage audit: prove the bridge reaches the whole API --------
+      window.__audit = auditCoverage(CanvasKit);
+
+      // ---- 2. Render the real Elpian flutter.dart app on Skia ---------------
+      const [wasmBytes, src] = await Promise.all([
+        fetch('elpian_dart.wasm').then((r) => r.arrayBuffer()),
+        fetch('demo_app.dart').then((r) => r.text()),
+      ]);
+      const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+      const ex = instance.exports;
+      const enc = new TextEncoder().encode(src);
+      const ptr = ex.elpian_alloc(enc.length);
+      new Uint8Array(ex.memory.buffer, ptr, enc.length).set(enc);
+      ex.elpian_init_flutter(ptr, enc.length);
+
+      const appBridge = new SkiaBridge(CanvasKit).attachCanvas(document.getElementById('app'));
+      appBridge.useFont(fontBytes, 'sans-serif');
+      const readScene = () => {
+        const len = ex.elpian_frame();
+        const rptr = ex.elpian_result_ptr();
+        return JSON.parse(new TextDecoder().decode(new Uint8Array(ex.memory.buffer, rptr, len)));
+      };
+      const renderApp = () => { window.__scene = readScene(); appBridge.paintScene(window.__scene); };
+      renderApp();
+
+      // Interactive: real clicks -> Elpian onPointerEvent -> setState -> Skia repaint.
+      const appCanvas = document.getElementById('app');
+      appCanvas.addEventListener('click', (e) => {
+        const rect = appCanvas.getBoundingClientRect();
+        const x = e.clientX - rect.left, y = e.clientY - rect.top;
+        ex.elpian_pointer(x, y, 1);
+        ex.elpian_pointer(x, y, 0);
+        renderApp();
+      });
+      window.__renderApp = renderApp; // for the test to drive taps deterministically
+      window.__tap = (x, y) => { ex.elpian_pointer(x, y, 1); ex.elpian_pointer(x, y, 0); renderApp(); };
+
+      // ---- 3. Full-Skia showcase via the reflective program interpreter -----
+      const showcase = new SkiaBridge(CanvasKit).attachCanvas(document.getElementById('showcase'));
+      showcase.useFont(fontBytes, 'sans-serif');
+      const P = {
+        clear: { color: [0.07, 0.08, 0.11, 1] },
+        steps: [
+          // A gradient-filled rounded rectangle.
+          { def: 1, make: 'Paint' },
+          { ref: 1, method: 'setAntiAlias', args: [true] },
+          { def: 2, static: 'Shader.MakeLinearGradient',
+            args: [[0, 0], [400, 0],
+                   [{ color: [0.13, 0.83, 0.98, 1] }, { color: [0.61, 0.35, 0.98, 1] }],
+                   [0, 1], { enum: 'TileMode.Clamp' }] },
+          { ref: 1, method: 'setShader', args: [{ ref: 2 }] },
+          { canvas: 'drawRRect', args: [{ rrect: { rect: [20, 20, 380, 120], rx: 16, ry: 16 } }, { ref: 1 }] },
+
+          // A stroked bezier path with a blur mask filter.
+          { def: 3, make: 'Paint' },
+          { ref: 3, method: 'setAntiAlias', args: [true] },
+          { ref: 3, method: 'setStyle', args: [{ enum: 'PaintStyle.Stroke' }] },
+          { ref: 3, method: 'setStrokeWidth', args: [6] },
+          { ref: 3, method: 'setColor', args: [{ color: [1, 0.42, 0.21, 1] }] },
+          { def: 4, static: 'MaskFilter.MakeBlur', args: [{ enum: 'BlurStyle.Normal' }, 2.5, true] },
+          { ref: 3, method: 'setMaskFilter', args: [{ ref: 4 }] },
+          { def: 5, make: 'Path' },
+          { ref: 5, method: 'moveTo', args: [30, 200] },
+          { ref: 5, method: 'cubicTo', args: [120, 140, 260, 260, 370, 200] },
+          { canvas: 'drawPath', args: [{ ref: 5 }, { ref: 3 }] },
+
+          // A translucent circle composited through a saveLayer + image filter blur.
+          { def: 6, make: 'Paint' },
+          { def: 7, static: 'ImageFilter.MakeBlur', args: [6, 6, { enum: 'TileMode.Decal' }, null] },
+          { ref: 6, method: 'setImageFilter', args: [{ ref: 7 }] },
+          { canvas: 'saveLayer', args: [{ ref: 6 }] },
+          { def: 8, make: 'Paint' },
+          { ref: 8, method: 'setColor', args: [{ color: [0.30, 0.69, 0.31, 0.9] }] },
+          { canvas: 'drawCircle', args: [110, 270, 34, { ref: 8 }] },
+          { canvas: 'restore' },
+
+          // Real shaped text via the Paragraph API.
+          { canvas: 'drawParagraph', args: [
+            { paragraph: { text: 'Real Skia text — shaped by CanvasKit', fontSize: 20,
+                           color: [0.9, 0.94, 1, 1], weight: 'bold', maxWidth: 380 } }, 20, 250] },
+        ],
+      };
+      showcase.runProgram(P);
+
+      window.__ready = true;
+    }
+    main().catch((e) => { window.__error = String(e && e.stack || e); });
+  </script>
+</body>
+</html>

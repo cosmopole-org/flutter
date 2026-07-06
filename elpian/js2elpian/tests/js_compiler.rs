@@ -7,7 +7,7 @@ use elpian_vm::api;
 /// Register a VM from JS, run its top-level program, then call `func` and return
 /// the stringified result value.
 fn run_js_and_call(id: &str, js: &str, func: &str) -> String {
-    assert!(api::create_vm_from_js(id.to_string(), js.to_string()), "JS should compile");
+    assert!(js2elpian::create_vm_from_js(id.to_string(), js.to_string()), "JS should compile");
     let _ = api::execute_vm(id.to_string());
     api::execute_vm_func(id.to_string(), func.to_string(), 1).result_value
 }
@@ -58,7 +58,7 @@ fn if_else_if_else_chain() {
         else { return 3; }
     }";
     let id = "js-if";
-    assert!(api::create_vm_from_js(id.to_string(), js.to_string()));
+    assert!(js2elpian::create_vm_from_js(id.to_string(), js.to_string()));
     let _ = api::execute_vm(id.to_string());
     let call = |n: i64| {
         api::execute_vm_func_with_input(id.to_string(), "classify".into(), n.to_string(), 1)
@@ -77,7 +77,7 @@ fn early_return_skips_rest_of_body() {
         return 2;
     }";
     let id = "js-early-return";
-    assert!(api::create_vm_from_js(id.to_string(), js.to_string()));
+    assert!(js2elpian::create_vm_from_js(id.to_string(), js.to_string()));
     let _ = api::execute_vm(id.to_string());
     let call = |n: i64| {
         api::execute_vm_func_with_input(id.to_string(), "f".into(), n.to_string(), 1).result_value
@@ -140,7 +140,7 @@ fn top_level_state_and_function() {
     // Top-level `let` runs during execute_vm; the function closes over it.
     let js = "let x = 5; function getx() { return x; }";
     let id = "js-toplevel";
-    assert!(api::create_vm_from_js(id.to_string(), js.to_string()));
+    assert!(js2elpian::create_vm_from_js(id.to_string(), js.to_string()));
     let _ = api::execute_vm(id.to_string());
     assert_eq!(api::execute_vm_func(id.to_string(), "getx".into(), 1).result_value, "5");
 }
@@ -176,7 +176,7 @@ fn switch_with_returns() {
         return 0;
     }";
     let id = "js-switch";
-    assert!(api::create_vm_from_js(id.to_string(), js.to_string()));
+    assert!(js2elpian::create_vm_from_js(id.to_string(), js.to_string()));
     let _ = api::execute_vm(id.to_string());
     let call = |n: i64| {
         api::execute_vm_func_with_input(id.to_string(), "classify".into(), n.to_string(), 1)
@@ -193,7 +193,7 @@ fn function_without_return_does_not_leak_previous_result() {
     // second must not inherit the first's value (no stale pending result).
     let js = "function getfive() { return 5; } function noret() { let x = 1; }";
     let id = "js-noleak";
-    assert!(api::create_vm_from_js(id.to_string(), js.to_string()));
+    assert!(js2elpian::create_vm_from_js(id.to_string(), js.to_string()));
     let _ = api::execute_vm(id.to_string());
     assert_eq!(api::execute_vm_func(id.to_string(), "getfive".into(), 1).result_value, "5");
     let noret = api::execute_vm_func(id.to_string(), "noret".into(), 2).result_value;
@@ -202,20 +202,20 @@ fn function_without_return_does_not_leak_previous_result() {
 
 #[test]
 fn validate_js_accepts_and_rejects() {
-    assert!(api::validate_js("function f() { return 1 + 2; }".to_string()));
+    assert!(js2elpian::validate_js("function f() { return 1 + 2; }".to_string()));
     // Unterminated block is outside the supported subset → rejected, no panic.
-    assert!(!api::validate_js("function f() { return ".to_string()));
+    assert!(!js2elpian::validate_js("function f() { return ".to_string()));
 }
 
 #[test]
 fn invalid_js_fails_to_create_vm() {
     // A stray operator with no operand cannot be lowered; creation returns false.
-    assert!(!api::create_vm_from_js("js-bad".to_string(), "let x = = ;".to_string()));
+    assert!(!js2elpian::create_vm_from_js("js-bad".to_string(), "let x = = ;".to_string()));
 }
 
 #[test]
 fn compile_js_to_ast_produces_program_node() {
-    let ast = api::compile_js_to_ast("let x = 1;".to_string());
+    let ast = js2elpian::compile_js_to_ast("let x = 1;".to_string());
     assert!(ast.contains("\"program\""), "ast was: {ast}");
     assert!(ast.contains("\"definition\""), "ast was: {ast}");
 }
@@ -335,7 +335,7 @@ fn statement_after_control_block_does_not_unbalance_in_called_fn() {
             let o = { len: len(r), first: r[0], last: r[2] };
             return o.len * 100 + o.first * 10 + o.last;   // 3*100 + 1*10 + 99 = 409
         }";
-    assert!(api::create_vm_from_js(id.to_string(), js.to_string()));
+    assert!(js2elpian::create_vm_from_js(id.to_string(), js.to_string()));
     let _ = api::execute_vm(id.to_string());
     assert_eq!(api::execute_vm_func(id.to_string(), "f".into(), 1).result_value, "409");
 
@@ -352,7 +352,7 @@ fn statement_after_control_block_does_not_unbalance_in_called_fn() {
             return a;
         }
         function f() { let a = build(); return concat(a[2].tag, str(len(a))); }";
-    assert!(api::create_vm_from_js(id2.to_string(), js2.to_string()));
+    assert!(js2elpian::create_vm_from_js(id2.to_string(), js2.to_string()));
     let _ = api::execute_vm(id2.to_string());
     assert_eq!(api::execute_vm_func(id2.to_string(), "f".into(), 1).result_value, "\"hi3\"");
 }

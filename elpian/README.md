@@ -84,6 +84,7 @@ Every `dart:*` call passes through both:
 | **P6** front-end deepening — `for-in` loops + hex int literals (`0xFF2196F3`) | ✅ built, tested | `dart_frontend.rs` |
 | **P7** **`flutter.dart` library** — a large, idiomatic Flutter widget/painting library (`Widget`/`State`/`Color`/`Colors`/`EdgeInsets`/`Alignment`/`BoxConstraints`/enums/`RenderFlex`-style layout/`MaterialApp`/`Scaffold`/`AppBar`/`Card`/…), `import`ed by an app | ✅ built, tested | `flutter/flutter.dart` |
 | **P7** front-end idioms — annotations, `abstract`, `const`, `enum`, `static` members + named ctors, **getters**, `??`, `void`-arrow bodies | ✅ built, tested | `dart_frontend.rs` |
+| **P8** **real Skia via CanvasKit** — a reflective bridge that drives the *entire* Skia API (construct/call/enum/marshal by name; audited 575 symbols, 0 unreachable), replaying Elpian scenes/programs on genuine Skia with real text | ✅ built, browser-tested | `web-demo/canvaskit_bridge.js` |
 | native + `wasm32` compilation | ✅ verified | — |
 
 **190 tests pass** (native) and the whole stack builds for `wasm32`. The
@@ -179,6 +180,23 @@ to accept the idioms the real framework is written in (annotations, `abstract`,
 `const`, `enum`, `static` members + named constructors, getters, `??`). *Deepen:*
 `Stack` fit/clipping, `ListView`/scrolling, `Theme`/`InheritedWidget`, keyed
 reconciliation, animations, and engine-provided text metrics.
+
+**Phase 8 — real Skia via CanvasKit ✅.** A **reflective bridge**
+([`web-demo/canvaskit_bridge.js`](web-demo/canvaskit_bridge.js)) drives real Skia
+through **CanvasKit** (Skia-in-WASM — the renderer Flutter web uses). Rather than
+hand-wrapping Skia's ~1000 methods, it interprets a uniform "Skia program": it
+can construct any object, call any static factory or instance method, resolve any
+enum/constant, and marshal every Skia argument shape (colors, rects, rrects,
+matrices, scalar/point arrays, typed data, handles, nested option dicts) — all
+**by name**, so it covers the **entire Skia API with no exceptions**, audited at
+runtime against the loaded library (575 symbols, 0 unreachable). It replays both
+Elpian widget scenes (with **real text layout** via CanvasKit's Paragraph API)
+and raw programs a guest emits over `dart:ui`. Verified headless: the
+`flutter.dart` app rasterized by real Skia (interactive), a full-API showcase
+(gradients, Bézier paths, mask/image-filter blur, `saveLayer`, shaped text), and
+a guest that drives Skia directly from bytecode. *Deepen:* GPU (WebGL/WebGPU)
+surface in production, `dart:ui` recorder emitting the program in Rust, and the
+matching native Skia/Impeller binding for iOS/Android/desktop.
 
 ## Honest scope statement
 

@@ -54,19 +54,6 @@ impl VM {
         let byte_code = compiler::compile_code(program);
         Self::compile_and_create_of_bytecode(machine_id, byte_code, func_group)
     }
-    /// Build an instance from JavaScript source. The JS is first lowered to the
-    /// Elpian AST JSON (per the compiler module's AST spec) and then handed to
-    /// [`Self::compile_and_create_of_ast`] — the same `from ast` path used for
-    /// hand-written ASTs — so JS, AST, and bytecode all converge on one pipeline.
-    pub fn compile_and_create_of_js(
-        machine_id: String,
-        program: String,
-        executor_count: i32,
-        func_group: Vec<String>,
-    ) -> Self {
-        let ast = compiler::parse_js(&program);
-        Self::compile_and_create_of_ast(machine_id, ast, executor_count, func_group)
-    }
     pub fn print_memory(&mut self) {}
     pub fn run(&mut self) -> Val {
         self.run_func_with_input("", None, 0)

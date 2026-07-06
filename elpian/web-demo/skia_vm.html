@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Elpian VM → raw Skia ops → CanvasKit</title>
+  <style>
+    body { background: #0b0d14; color: #cbd5e1; font-family: system-ui, sans-serif; margin: 16px; }
+    canvas { border: 1px solid #2a2e3e; border-radius: 8px; background: #12141c; cursor: pointer; }
+    code { color: #7dd3fc; }
+  </style>
+</head>
+<body>
+  <h3>Guest bytecode drives the <b>full Skia API</b> directly — <code>askHost("dart:ui/...")</code> emits a reflective Skia program that CanvasKit rasterizes. Click to grow the circle.</h3>
+  <canvas id="c" width="400" height="340"></canvas>
+  <script src="canvaskit/canvaskit.js"></script>
+  <script type="module">
+    import { SkiaBridge } from './canvaskit_bridge.js';
+    async function main() {
+      const CanvasKit = await window.CanvasKitInit({ locateFile: (f) => 'canvaskit/' + f });
+      const fontBytes = new Uint8Array(await fetch('canvaskit/font.ttf').then((r) => r.arrayBuffer()));
+      const [wasmBytes, src] = await Promise.all([
+        fetch('elpian_dart.wasm').then((r) => r.arrayBuffer()),
+        fetch('skia_guest.dart').then((r) => r.text()),
+      ]);
+      const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+      const ex = instance.exports;
+      const enc = new TextEncoder().encode(src);
+      const ptr = ex.elpian_alloc(enc.length);
+      new Uint8Array(ex.memory.buffer, ptr, enc.length).set(enc);
+      ex.elpian_init(ptr, enc.length); // raw dart:ui guest (no widget framework)
+
+      const bridge = new SkiaBridge(CanvasKit).attachCanvas(document.getElementById('c'));
+      bridge.useFont(fontBytes, 'sans-serif');
+      const render = () => {
+        const len = ex.elpian_frame();
+        const rptr = ex.elpian_result_ptr();
+        const frame = JSON.parse(new TextDecoder().decode(new Uint8Array(ex.memory.buffer, rptr, len)));
+        window.__frame = frame;
+        bridge.render(frame); // frame.skia -> runProgram -> real Skia
+      };
+      render();
+
+      const c = document.getElementById('c');
+      c.addEventListener('click', (e) => {
+        const r = c.getBoundingClientRect();
+        ex.elpian_pointer(e.clientX - r.left, e.clientY - r.top, 1);
+        ex.elpian_pointer(e.clientX - r.left, e.clientY - r.top, 0);
+        render();
+      });
+      window.__tap = () => { ex.elpian_pointer(50, 50, 1); ex.elpian_pointer(50, 50, 0); render(); };
+      window.__ready = true;
+    }
+    main().catch((e) => { window.__error = String(e && e.stack || e); });
+  </script>
+</body>
+</html>

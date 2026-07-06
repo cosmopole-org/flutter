@@ -44,7 +44,6 @@ pub mod binding;
 pub mod bundle;
 pub mod convert;
 pub mod core;
-pub mod dart_frontend;
 pub mod dart_ui;
 pub mod governance;
 pub mod isolate;

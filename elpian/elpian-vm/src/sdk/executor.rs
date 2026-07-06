@@ -8,6 +8,7 @@ use crate::sdk::{
     limits::{Governor, ResourceLimits},
     program::{DecodedProgram, UnitKind},
     stdlib,
+    type_methods::{self, CoreType, Dispatch},
 };
 use core::panic;
 use std::{cell::RefCell, collections::HashMap, fmt, i16, rc::Rc};
@@ -788,91 +789,6 @@ impl Operation for Arithmetic {
             self.arg2.clone().unwrap(),
         ]
     }
-}
-
-/// Core `List` method names that resolve to a bound native method (typ 253).
-fn is_list_method(key: &str) -> bool {
-    matches!(
-        key,
-        "add" | "contains"
-            | "indexOf"
-            | "removeLast"
-            | "sublist"
-            | "join"
-            | "addAll"
-            | "removeAt"
-            | "insert"
-            | "clear"
-    )
-}
-
-/// `List` getters (no parens) — dispatched eagerly to their value.
-fn is_list_getter(key: &str) -> bool {
-    matches!(key, "first" | "last" | "reversed")
-}
-
-/// Core `num`/`int`/`double` method names (receiver is a number, typ 1-5).
-fn is_num_method(key: &str) -> bool {
-    matches!(
-        key,
-        "toInt"
-            | "toDouble"
-            | "abs"
-            | "floor"
-            | "ceil"
-            | "round"
-            | "toString"
-            | "toStringAsFixed"
-            | "clamp"
-    )
-}
-
-/// `num` getters (no parens).
-fn is_num_getter(key: &str) -> bool {
-    matches!(key, "isNaN" | "isNegative")
-}
-
-/// Plain-`Map` method names (only for objects without a `__class` tag).
-fn is_map_method(key: &str) -> bool {
-    matches!(key, "containsKey" | "remove" | "putIfAbsent")
-}
-
-/// Plain-`Map` getters (no parens).
-fn is_map_getter(key: &str) -> bool {
-    matches!(key, "keys" | "values" | "isEmpty" | "isNotEmpty")
-}
-
-/// Higher-order `List` methods implemented as prelude functions (they take a
-/// closure, so they run as guest bytecode: `__List_<name>` bound to the receiver
-/// via `this`). Resolved by looking the function up in globals.
-fn is_list_prelude_method(key: &str) -> bool {
-    matches!(
-        key,
-        "map" | "where" | "forEach" | "fold" | "any" | "every" | "reduce"
-    )
-}
-
-/// Core `String` method names that resolve to a bound native method.
-fn is_string_method(key: &str) -> bool {
-    matches!(
-        key,
-        "substring"
-            | "contains"
-            | "indexOf"
-            | "toUpperCase"
-            | "toLowerCase"
-            | "trim"
-            | "split"
-            | "startsWith"
-            | "endsWith"
-            | "replaceAll"
-            | "codeUnitAt"
-            | "padRight"
-            | "padLeft"
-            | "replaceFirst"
-            | "trimLeft"
-            | "trimRight"
-    )
 }
 
 struct IndexerValue {
@@ -1717,6 +1633,38 @@ impl Executor {
             };
         }
     }
+    /// Build the value that reading a resolved built-in type member yields. This
+    /// is the executor's *only* knowledge of type members: it defers every
+    /// name/behaviour decision to [`type_methods`], then realises the returned
+    /// [`Dispatch`] uniformly. `stdlib::invoke` runs the actual implementation.
+    fn deliver_type_member(&mut self, receiver: &Val, member: &type_methods::Member) -> Val {
+        match member.dispatch {
+            // A getter reads eagerly through stdlib.
+            Dispatch::Getter => stdlib::invoke(&member.qualified, &[receiver.clone()])
+                .unwrap_or_else(|_| self.check_int_range(0)),
+            // A method becomes a bound native (typ 253) carrying `[recv, name]`;
+            // the call machinery appends the args and calls `stdlib::invoke`.
+            Dispatch::Method => {
+                let name_val = Val { typ: 7, data: Payload::from(member.qualified.clone()) };
+                let holder = Array::new(vec![receiver.clone(), name_val]);
+                Val { typ: 253, data: Payload::from(Rc::new(RefCell::new(holder))) }
+            }
+            // A higher-order method binds the guest prelude fn `__<Type>_<name>`
+            // to the receiver, so its closure argument runs as guest bytecode.
+            Dispatch::Prelude => {
+                let prefix = member.qualified.split('.').next().unwrap_or("");
+                let fname = format!("__{}_{}", prefix, member.name);
+                let g = self.ctx.find_val_globally(&fname);
+                if g.typ == 10 {
+                    let bound = g.as_func().borrow().bind(receiver.clone());
+                    Val { typ: 10, data: Payload::from(Rc::new(RefCell::new(bound))) }
+                } else {
+                    Val { typ: 0, data: Payload::Null }
+                }
+            }
+        }
+    }
+
     fn check_int_range(&self, num: i64) -> Val {
         if num < i16::MAX.into() {
             return Val {
@@ -4858,63 +4806,17 @@ impl Executor {
                                     "isEmpty" => Val { typ: 6, data: Payload::from(len == 0) },
                                     _ => Val { typ: 6, data: Payload::from(len != 0) },
                                 });
-                            } else if (indexed.typ == 9 && is_list_method(&__key))
-                                || (indexed.typ == 7 && is_string_method(&__key))
+                            } else if let Some(member) = CoreType::of_tag(indexed.typ)
+                                .filter(|t| *t != CoreType::Map)
+                                .and_then(|t| type_methods::resolve(t, &__key))
                             {
-                                // A core-type method: return a bound native method
-                                // (typ 253) carrying the receiver + dispatch name.
-                                // The call machinery prepends the receiver and
-                                // dispatches through stdlib::invoke.
-                                let prefix = if indexed.typ == 9 { "List." } else { "String." };
-                                let name_val = Val {
-                                    typ: 7,
-                                    data: Payload::from(format!("{prefix}{__key}")),
-                                };
-                                let holder = Array::new(vec![indexed.clone(), name_val]);
-                                main_reg = Some(Val {
-                                    typ: 253,
-                                    data: Payload::from(Rc::new(RefCell::new(holder))),
-                                });
-                            } else if matches!(indexed.typ, 1 | 2 | 3 | 4 | 5)
-                                && is_num_getter(&__key)
-                            {
-                                // Numeric getter (e.g. `x.isNaN`): dispatched eagerly.
-                                main_reg = Some(
-                                    stdlib::invoke(&format!("Num.{__key}"), &[indexed.clone()])
-                                        .unwrap_or_else(|_| self.check_int_range(0)),
-                                );
-                            } else if matches!(indexed.typ, 1 | 2 | 3 | 4 | 5)
-                                && is_num_method(&__key)
-                            {
-                                // Numeric method on int/double: bound native.
-                                let name_val = Val {
-                                    typ: 7,
-                                    data: Payload::from(format!("Num.{__key}")),
-                                };
-                                let holder = Array::new(vec![indexed.clone(), name_val]);
-                                main_reg = Some(Val {
-                                    typ: 253,
-                                    data: Payload::from(Rc::new(RefCell::new(holder))),
-                                });
-                            } else if indexed.typ == 9 && is_list_getter(&__key) {
-                                // List getter (`xs.first`/`.last`/`.reversed`).
-                                main_reg = Some(
-                                    stdlib::invoke(&format!("List.{__key}"), &[indexed.clone()])
-                                        .unwrap_or_else(|_| self.check_int_range(0)),
-                                );
-                            } else if indexed.typ == 9 && is_list_prelude_method(&__key) {
-                                // Higher-order method: bind the prelude function
-                                // `__List_<name>` to the receiver (via `this`), so
-                                // it runs as guest bytecode and can call the guest
-                                // closure argument per element.
-                                let fname = format!("__List_{__key}");
-                                let g = self.ctx.find_val_globally(&fname);
-                                main_reg = Some(if g.typ == 10 {
-                                    let bound = g.as_func().borrow().bind(indexed.clone());
-                                    Val { typ: 10, data: Payload::from(Rc::new(RefCell::new(bound))) }
-                                } else {
-                                    Val { typ: 0, data: Payload::Null }
-                                });
+                                // A built-in List/String/num member: the executor
+                                // holds no method names — the stdlib registry owns
+                                // them and says how to deliver this one (a getter,
+                                // a bound native method, or a prelude closure fn).
+                                // Map members are handled in the object branch below
+                                // (they are gated on the absence of a `__class` tag).
+                                main_reg = Some(self.deliver_type_member(&indexed, &member));
                             } else if indexed.typ == 8 {
                                 let key = index.as_string();
                                 let own = indexed.as_object().borrow().data.data.get(&key).cloned();
@@ -4934,29 +4836,19 @@ impl Executor {
                                         .data
                                         .get("__class")
                                         .is_none();
+                                    let map_member = if is_plain_map {
+                                        type_methods::resolve(CoreType::Map, &key)
+                                    } else {
+                                        None
+                                    };
                                     if is_plain_map && key == "length" {
                                         let n = indexed.as_object().borrow().data.data.len();
                                         main_reg = Some(self.check_int_range(n as i64));
-                                    } else if is_plain_map && is_map_getter(&key) {
-                                        // Map getter (`m.keys`/`.values`/`.isEmpty`).
-                                        main_reg = Some(
-                                            stdlib::invoke(
-                                                &format!("Map.{key}"),
-                                                &[indexed.clone()],
-                                            )
-                                            .unwrap_or_else(|_| self.check_int_range(0)),
-                                        );
-                                    } else if is_plain_map && is_map_method(&key) {
-                                        let name_val = Val {
-                                            typ: 7,
-                                            data: Payload::from(format!("Map.{key}")),
-                                        };
-                                        let holder =
-                                            Array::new(vec![indexed.clone(), name_val]);
-                                        main_reg = Some(Val {
-                                            typ: 253,
-                                            data: Payload::from(Rc::new(RefCell::new(holder))),
-                                        });
+                                    } else if let Some(member) = map_member {
+                                        // A plain-Map member (`keys`/`values`/`isEmpty`/
+                                        // `containsKey`/…): delivered by the same
+                                        // registry-driven path as List/String/num.
+                                        main_reg = Some(self.deliver_type_member(&indexed, &member));
                                     } else {
                                         // An absent key/field reads as null (integer 0),
                                         // matching Dart's `map[absent] == null`.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["elpian-vm", "elpian-dart"]
+members = ["elpian-vm", "js2elpian", "dart2elpian", "elpian-dart"]
 
 [profile.release]
 lto = true

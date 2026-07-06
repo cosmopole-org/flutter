@@ -6,20 +6,21 @@
 //! ## Pipeline
 //!
 //! ```text
-//! JS source ──(compiler::parse_js, in-VM front-end)──▶ Elpian AST JSON
+//! source language ──(front-end crate)──▶ Elpian AST JSON
 //!           ──(compiler::compile_ast)───────────────▶ bytecode (Vec<u8>)
 //!           ──(program::DecodedProgram::decode)──────▶ in-memory operation list
 //!           ──(executor)──────────────────────────────▶ execution + host calls
 //! ```
 //!
-//! An Elpa instance can therefore be created from JavaScript source just like
-//! from a hand-written AST: the compiler module lowers JS to the very same
-//! Elpian AST JSON and feeds it to the shared `from ast` compiler. An external
-//! acorn/babel front-end may still be used to emit the AST directly, but is no
-//! longer required.
+//! This crate is **purely the executor**: it ingests Elpian AST JSON
+//! ([`api::create_vm_from_ast`]) or prebuilt bytecode
+//! ([`api::create_vm_from_bytecode`]) and runs it. The *language* front-ends live
+//! in their own crates — `js2elpian` (JavaScript → AST) and `dart2elpian`
+//! (Dart → AST) — so the VM has no notion of any source language; every
+//! front-end converges on the shared `from ast` path.
 //!
-//! The front-end (JS/AST → bytecode) can run **ahead of time**: a tool compiles
-//! the program to bytecode once at build time (`api::compile_js_to_bytecode`),
+//! The front-end (source → bytecode) can run **ahead of time**: a tool compiles
+//! the program to bytecode once at build time (e.g. `js2elpian::compile_js_to_bytecode`),
 //! and the deployed app loads the bytecode straight into a VM
 //! (`api::create_vm_from_bytecode`) — no parsing or AST work at startup. The
 //! executor then decodes the bytecode **once**, at construction, into an

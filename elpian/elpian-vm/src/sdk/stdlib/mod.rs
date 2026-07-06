@@ -27,6 +27,8 @@ use std::rc::Rc;
 
 use crate::sdk::data::{Array, Object, Payload, Val, ValGroup, ValMap};
 
+pub(crate) mod types;
+
 /// Object `typ` tag for a class descriptor produced by `class` / `extend`.
 pub const CLASS_TYPE: i64 = -100;
 /// Object `typ` tag for an instance produced by `new`.
@@ -38,28 +40,28 @@ pub const CELL_TYPE: i64 = -102;
 // Value constructors (kept terse so the builtin bodies read like math).
 // ----------------------------------------------------------------------------
 
-fn vnull() -> Val {
+pub(crate) fn vnull() -> Val {
     Val::new(0, Payload::Null)
 }
-fn vbool(b: bool) -> Val {
+pub(crate) fn vbool(b: bool) -> Val {
     Val::new(6, Payload::from(b))
 }
-fn vi64(n: i64) -> Val {
+pub(crate) fn vi64(n: i64) -> Val {
     Val::new(3, Payload::from(n))
 }
-fn vf64(n: f64) -> Val {
+pub(crate) fn vf64(n: f64) -> Val {
     Val::new(5, Payload::from(n))
 }
-fn vstr(s: String) -> Val {
+pub(crate) fn vstr(s: String) -> Val {
     Val::new(7, Payload::from(s))
 }
-fn varr(items: Vec<Val>) -> Val {
+pub(crate) fn varr(items: Vec<Val>) -> Val {
     Val::new(
         9,
         Payload::from(Rc::new(RefCell::new(Array::new(items)))),
     )
 }
-fn vobj(typ: i64, map: ValMap) -> Val {
+pub(crate) fn vobj(typ: i64, map: ValMap) -> Val {
     Val::new(
         8,
         Payload::from(Rc::new(RefCell::new(Object::new(
@@ -70,7 +72,7 @@ fn vobj(typ: i64, map: ValMap) -> Val {
 }
 
 /// Coerce any numeric value to `f64`. Errors on non-numeric inputs.
-fn as_num(v: &Val) -> Result<f64, String> {
+pub(crate) fn as_num(v: &Val) -> Result<f64, String> {
     match v.typ {
         1 => Ok(v.as_i16() as f64),
         2 => Ok(v.as_i32() as f64),
@@ -83,13 +85,13 @@ fn as_num(v: &Val) -> Result<f64, String> {
 }
 
 /// Coerce to `i64` (truncating floats).
-fn as_int(v: &Val) -> Result<i64, String> {
+pub(crate) fn as_int(v: &Val) -> Result<i64, String> {
     Ok(as_num(v)? as i64)
 }
 
 /// Produce the most compact numeric value: an integer if the float is whole and
 /// in range, otherwise an f64. Keeps arithmetic results idiomatic.
-fn num_result(x: f64) -> Val {
+pub(crate) fn num_result(x: f64) -> Val {
     if x.is_finite() && x.fract() == 0.0 && x.abs() < 9.007_199_254_740_992e15 {
         vi64(x as i64)
     } else {
@@ -97,7 +99,7 @@ fn num_result(x: f64) -> Val {
     }
 }
 
-fn arity(name: &str, args: &[Val], n: usize) -> Result<(), String> {
+pub(crate) fn arity(name: &str, args: &[Val], n: usize) -> Result<(), String> {
     if args.len() != n {
         Err(format!("{name} expects {n} argument(s), got {}", args.len()))
     } else {
@@ -105,7 +107,7 @@ fn arity(name: &str, args: &[Val], n: usize) -> Result<(), String> {
     }
 }
 
-fn at_least(name: &str, args: &[Val], n: usize) -> Result<(), String> {
+pub(crate) fn at_least(name: &str, args: &[Val], n: usize) -> Result<(), String> {
     if args.len() < n {
         Err(format!("{name} expects at least {n} argument(s), got {}", args.len()))
     } else {
@@ -235,6 +237,17 @@ pub fn is_builtin(name: &str) -> bool {
 /// Invoke a builtin by name. Returns the result value or a guest-visible error
 /// string (which the executor surfaces as a trap). `args` are already evaluated.
 pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
+    // Type-method calls (`String.toUpperCase`, `List.add`, `Num.abs`, `Map.keys`)
+    // are grouped object-orientedly per type in `types`; route them there.
+    if let Some((ty, method)) = name.split_once('.') {
+        match ty {
+            "String" => return types::string::invoke(name, method, args),
+            "List" => return types::list::invoke(name, method, args),
+            "Num" => return types::num::invoke(name, method, args),
+            "Map" => return types::map::invoke(name, method, args),
+            _ => {}
+        }
+    }
     match name {
         // ---- math constants -------------------------------------------------
         "PI" => Ok(vf64(std::f64::consts::PI)),
@@ -875,264 +888,6 @@ pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
             Ok(args[0].clone())
         }
 
-        // ---- bound core-type methods (receiver threaded as args[0]) --------
-        "List.add" => {
-            at_least(name, args, 2)?;
-            args[0].as_array().borrow_mut().data.push(args[1].clone());
-            Ok(Val::new(0, Payload::Null))
-        }
-        "List.removeLast" => {
-            let popped = args[0].as_array().borrow_mut().data.pop();
-            Ok(popped.unwrap_or_else(|| Val::new(0, Payload::Null)))
-        }
-        "List.first" => {
-            let a = args[0].as_array();
-            let out = a.borrow().data.first().cloned();
-            Ok(out.unwrap_or_else(|| Val::new(0, Payload::Null)))
-        }
-        "List.last" => {
-            let a = args[0].as_array();
-            let out = a.borrow().data.last().cloned();
-            Ok(out.unwrap_or_else(|| Val::new(0, Payload::Null)))
-        }
-        "List.contains" => {
-            at_least(name, args, 2)?;
-            let target = args[1].stringify();
-            let a = args[0].as_array();
-            let found = a.borrow().data.iter().any(|e| e.stringify() == target);
-            Ok(vbool(found))
-        }
-        "List.indexOf" => {
-            at_least(name, args, 2)?;
-            let target = args[1].stringify();
-            let a = args[0].as_array();
-            let idx = a
-                .borrow()
-                .data
-                .iter()
-                .position(|e| e.stringify() == target)
-                .map(|i| i as i64)
-                .unwrap_or(-1);
-            Ok(vi64(idx))
-        }
-        "List.sublist" => {
-            at_least(name, args, 2)?;
-            let a = args[0].as_array();
-            let b = a.borrow();
-            let start = (as_int(&args[1])? as usize).min(b.data.len());
-            let end = match args.get(2) {
-                Some(v) => (as_int(v)? as usize).min(b.data.len()),
-                None => b.data.len(),
-            }
-            .max(start);
-            Ok(varr(b.data[start..end].to_vec()))
-        }
-        "List.join" => {
-            let a = args[0].as_array();
-            let sep = args.get(1).map(|v| v.as_string()).unwrap_or_default();
-            let joined = a
-                .borrow()
-                .data
-                .iter()
-                .map(|e| if e.typ == 7 { e.as_string() } else { e.stringify() })
-                .collect::<Vec<_>>()
-                .join(&sep);
-            Ok(vstr(joined))
-        }
-        "String.toUpperCase" => Ok(vstr(args[0].as_string().to_uppercase())),
-        "String.toLowerCase" => Ok(vstr(args[0].as_string().to_lowercase())),
-        "String.trim" => Ok(vstr(args[0].as_string().trim().to_string())),
-        "String.contains" => {
-            at_least(name, args, 2)?;
-            Ok(vbool(args[0].as_string().contains(&args[1].as_string())))
-        }
-        "String.startsWith" => {
-            at_least(name, args, 2)?;
-            Ok(vbool(args[0].as_string().starts_with(&args[1].as_string())))
-        }
-        "String.endsWith" => {
-            at_least(name, args, 2)?;
-            Ok(vbool(args[0].as_string().ends_with(&args[1].as_string())))
-        }
-        "String.replaceAll" => {
-            at_least(name, args, 3)?;
-            Ok(vstr(args[0].as_string().replace(&args[1].as_string(), &args[2].as_string())))
-        }
-        "String.indexOf" => {
-            at_least(name, args, 2)?;
-            let s = args[0].as_string();
-            let needle = args[1].as_string();
-            let idx = s.find(&needle).map(|b| s[..b].chars().count() as i64).unwrap_or(-1);
-            Ok(vi64(idx))
-        }
-        "String.substring" => {
-            at_least(name, args, 2)?;
-            let s = args[0].as_string();
-            let chars: Vec<char> = s.chars().collect();
-            let start = (as_int(&args[1])? as usize).min(chars.len());
-            let end = match args.get(2) {
-                Some(v) => (as_int(v)? as usize).min(chars.len()),
-                None => chars.len(),
-            }
-            .max(start);
-            Ok(vstr(chars[start..end].iter().collect()))
-        }
-        "String.split" => {
-            at_least(name, args, 2)?;
-            let s = args[0].as_string();
-            let sep = args[1].as_string();
-            Ok(varr(s.split(&sep).map(|p| vstr(p.to_string())).collect()))
-        }
-        "String.codeUnitAt" => {
-            at_least(name, args, 2)?;
-            let s = args[0].as_string();
-            let i = as_int(&args[1])? as usize;
-            Ok(vi64(s.encode_utf16().nth(i).map(|c| c as i64).unwrap_or(0)))
-        }
-        "String.padRight" => {
-            at_least(name, args, 2)?;
-            let s = args[0].as_string();
-            let width = as_int(&args[1])? as usize;
-            let pad = args.get(2).map(|v| v.as_string()).unwrap_or_else(|| " ".into());
-            let padc = pad.chars().next().unwrap_or(' ');
-            let deficit = width.saturating_sub(s.chars().count());
-            Ok(vstr(format!("{}{}", s, padc.to_string().repeat(deficit))))
-        }
-        "String.padLeft" => {
-            at_least(name, args, 2)?;
-            let s = args[0].as_string();
-            let width = as_int(&args[1])? as usize;
-            let pad = args.get(2).map(|v| v.as_string()).unwrap_or_else(|| " ".into());
-            let padc = pad.chars().next().unwrap_or(' ');
-            let deficit = width.saturating_sub(s.chars().count());
-            Ok(vstr(format!("{}{}", padc.to_string().repeat(deficit), s)))
-        }
-        "String.replaceFirst" => {
-            at_least(name, args, 3)?;
-            Ok(vstr(args[0].as_string().replacen(&args[1].as_string(), &args[2].as_string(), 1)))
-        }
-        "String.trimLeft" => Ok(vstr(args[0].as_string().trim_start().to_string())),
-        "String.trimRight" => Ok(vstr(args[0].as_string().trim_end().to_string())),
-
-        // ---- num methods (receiver is a number) ----------------------------
-        "Num.toInt" => Ok(vi64(as_num(&args[0])?.trunc() as i64)),
-        "Num.toDouble" => Ok(vf64(as_num(&args[0])?)),
-        "Num.abs" => {
-            if matches!(args[0].typ, 1 | 2 | 3) {
-                Ok(vi64(as_int(&args[0])?.abs()))
-            } else {
-                Ok(vf64(as_num(&args[0])?.abs()))
-            }
-        }
-        "Num.floor" => Ok(vi64(as_num(&args[0])?.floor() as i64)),
-        "Num.ceil" => Ok(vi64(as_num(&args[0])?.ceil() as i64)),
-        "Num.round" => Ok(vi64(as_num(&args[0])?.round() as i64)),
-        "Num.isNaN" => Ok(vbool(as_num(&args[0])?.is_nan())),
-        "Num.isNegative" => Ok(vbool(as_num(&args[0])? < 0.0)),
-        "Num.toString" => {
-            if matches!(args[0].typ, 1 | 2 | 3) {
-                Ok(vstr(as_int(&args[0])?.to_string()))
-            } else {
-                let d = as_num(&args[0])?;
-                Ok(vstr(if d.fract() == 0.0 { format!("{d:.1}") } else { format!("{d}") }))
-            }
-        }
-        "Num.toStringAsFixed" => {
-            at_least(name, args, 2)?;
-            let d = as_num(&args[0])?;
-            let k = as_int(&args[1])? as usize;
-            Ok(vstr(format!("{d:.*}", k)))
-        }
-        "Num.clamp" => {
-            at_least(name, args, 3)?;
-            let (x, lo, hi) = (as_num(&args[0])?, as_num(&args[1])?, as_num(&args[2])?);
-            Ok(num_result(x.max(lo).min(hi)))
-        }
-
-        // ---- more List methods --------------------------------------------
-        "List.addAll" => {
-            at_least(name, args, 2)?;
-            let other = args[1].as_array().borrow().data.clone();
-            args[0].as_array().borrow_mut().data.extend(other);
-            Ok(Val::new(0, Payload::Null))
-        }
-        "List.removeAt" => {
-            at_least(name, args, 2)?;
-            let i = as_int(&args[1])? as usize;
-            let a = args[0].as_array();
-            let mut b = a.borrow_mut();
-            if i < b.data.len() {
-                Ok(b.data.remove(i))
-            } else {
-                Err("RangeError: removeAt out of range".into())
-            }
-        }
-        "List.insert" => {
-            at_least(name, args, 3)?;
-            let i = as_int(&args[1])? as usize;
-            let a = args[0].as_array();
-            let mut b = a.borrow_mut();
-            let idx = i.min(b.data.len());
-            b.data.insert(idx, args[2].clone());
-            Ok(Val::new(0, Payload::Null))
-        }
-        "List.clear" => {
-            args[0].as_array().borrow_mut().data.clear();
-            Ok(Val::new(0, Payload::Null))
-        }
-        "List.reversed" => {
-            let mut v = args[0].as_array().borrow().data.clone();
-            v.reverse();
-            Ok(varr(v))
-        }
-
-        // ---- Map methods (receiver is a plain object) ----------------------
-        "Map.keys" => {
-            let o = expect_object(name, &args[0])?;
-            let b = o.borrow();
-            let keys: Vec<Val> = b.data.data.keys().map(|k| vstr(k.clone())).collect();
-            Ok(varr(keys))
-        }
-        "Map.values" => {
-            let o = expect_object(name, &args[0])?;
-            let b = o.borrow();
-            let vals: Vec<Val> = b.data.data.values().cloned().collect();
-            Ok(varr(vals))
-        }
-        "Map.containsKey" => {
-            at_least(name, args, 2)?;
-            let o = expect_object(name, &args[0])?;
-            let has = o.borrow().data.data.contains_key(&args[1].as_string());
-            Ok(vbool(has))
-        }
-        "Map.remove" => {
-            at_least(name, args, 2)?;
-            let o = expect_object(name, &args[0])?;
-            let removed = o.borrow_mut().data.data.remove(&args[1].as_string());
-            Ok(removed.unwrap_or_else(|| Val::new(0, Payload::Null)))
-        }
-        "Map.putIfAbsent" => {
-            at_least(name, args, 3)?;
-            let o = expect_object(name, &args[0])?;
-            let key = args[1].as_string();
-            let mut b = o.borrow_mut();
-            if !b.data.data.contains_key(&key) {
-                b.data.data.insert(key.clone(), args[2].clone());
-            }
-            let out = b.data.data.get(&key).cloned().unwrap_or_else(|| Val::new(0, Payload::Null));
-            Ok(out)
-        }
-        "Map.isEmpty" => {
-            let o = expect_object(name, &args[0])?;
-            let empty = o.borrow().data.data.is_empty();
-            Ok(vbool(empty))
-        }
-        "Map.isNotEmpty" => {
-            let o = expect_object(name, &args[0])?;
-            let empty = o.borrow().data.data.is_empty();
-            Ok(vbool(!empty))
-        }
-
         _ => Err(format!("unknown builtin '{name}'")),
     }
 }
@@ -1141,29 +896,29 @@ pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
 // Helpers shared across builtins.
 // ----------------------------------------------------------------------------
 
-fn unary(name: &str, args: &[Val], f: impl Fn(f64) -> f64) -> Result<Val, String> {
+pub(crate) fn unary(name: &str, args: &[Val], f: impl Fn(f64) -> f64) -> Result<Val, String> {
     arity(name, args, 1)?;
     Ok(num_result(f(as_num(&args[0])?)))
 }
 
 /// Like `unary`, but the mathematically-integer results (`floor`, `ceil`, …)
 /// always come back as integers when finite.
-fn unary_int(name: &str, args: &[Val], f: impl Fn(f64) -> f64) -> Result<Val, String> {
+pub(crate) fn unary_int(name: &str, args: &[Val], f: impl Fn(f64) -> f64) -> Result<Val, String> {
     arity(name, args, 1)?;
     Ok(num_result(f(as_num(&args[0])?)))
 }
 
-fn binary(name: &str, args: &[Val], f: impl Fn(f64, f64) -> f64) -> Result<Val, String> {
+pub(crate) fn binary(name: &str, args: &[Val], f: impl Fn(f64, f64) -> f64) -> Result<Val, String> {
     arity(name, args, 2)?;
     Ok(num_result(f(as_num(&args[0])?, as_num(&args[1])?)))
 }
 
-fn str_map(name: &str, args: &[Val], f: impl Fn(String) -> String) -> Result<Val, String> {
+pub(crate) fn str_map(name: &str, args: &[Val], f: impl Fn(String) -> String) -> Result<Val, String> {
     arity(name, args, 1)?;
     Ok(vstr(f(expect_string(name, &args[0])?)))
 }
 
-fn pad(name: &str, args: &[Val], start: bool) -> Result<Val, String> {
+pub(crate) fn pad(name: &str, args: &[Val], start: bool) -> Result<Val, String> {
     at_least(name, args, 2)?;
     let s = expect_string(name, &args[0])?;
     let width = as_int(&args[1])?.max(0) as usize;
@@ -1180,21 +935,21 @@ fn pad(name: &str, args: &[Val], start: bool) -> Result<Val, String> {
     Ok(vstr(if start { format!("{fill}{s}") } else { format!("{s}{fill}") }))
 }
 
-fn expect_object(name: &str, v: &Val) -> Result<Rc<RefCell<Object>>, String> {
+pub(crate) fn expect_object(name: &str, v: &Val) -> Result<Rc<RefCell<Object>>, String> {
     if v.typ == 8 {
         Ok(v.as_object())
     } else {
         Err(format!("{name} expects an object, got {}", type_name(v)))
     }
 }
-fn expect_array(name: &str, v: &Val) -> Result<Rc<RefCell<Array>>, String> {
+pub(crate) fn expect_array(name: &str, v: &Val) -> Result<Rc<RefCell<Array>>, String> {
     if v.typ == 9 {
         Ok(v.as_array())
     } else {
         Err(format!("{name} expects an array, got {}", type_name(v)))
     }
 }
-fn expect_string(name: &str, v: &Val) -> Result<String, String> {
+pub(crate) fn expect_string(name: &str, v: &Val) -> Result<String, String> {
     if v.typ == 7 {
         Ok(v.as_string())
     } else {
@@ -1203,14 +958,14 @@ fn expect_string(name: &str, v: &Val) -> Result<String, String> {
 }
 
 /// String form of a scalar/compound for joining and concatenation.
-fn str_of(v: &Val) -> String {
+pub(crate) fn str_of(v: &Val) -> String {
     match v.typ {
         7 => v.as_string(),
         _ => v.stringify().trim_matches('"').to_string(),
     }
 }
 
-fn truthy(v: &Val) -> bool {
+pub(crate) fn truthy(v: &Val) -> bool {
     match v.typ {
         0 => false,
         6 => v.as_bool(),
@@ -1221,7 +976,7 @@ fn truthy(v: &Val) -> bool {
     }
 }
 
-fn clamp_range(start: i64, end: Option<i64>, len: usize) -> (usize, usize) {
+pub(crate) fn clamp_range(start: i64, end: Option<i64>, len: usize) -> (usize, usize) {
     let len_i = len as i64;
     let norm = |i: i64| -> i64 {
         if i < 0 {
@@ -1235,7 +990,7 @@ fn clamp_range(start: i64, end: Option<i64>, len: usize) -> (usize, usize) {
     (s as usize, e.max(s) as usize)
 }
 
-fn gcd(mut a: i64, mut b: i64) -> i64 {
+pub(crate) fn gcd(mut a: i64, mut b: i64) -> i64 {
     while b != 0 {
         let t = b;
         b = a % b;
@@ -1246,7 +1001,7 @@ fn gcd(mut a: i64, mut b: i64) -> i64 {
 
 /// Structural-ish equality used by `contains`/`indexOf`: cheap and total. Scalars
 /// compare by value; strings by content; other types by their stringification.
-fn values_equal(a: &Val, b: &Val) -> bool {
+pub(crate) fn values_equal(a: &Val, b: &Val) -> bool {
     match (a.typ, b.typ) {
         (0, 0) => true,
         (6, 6) => a.as_bool() == b.as_bool(),
@@ -1265,7 +1020,7 @@ fn values_equal(a: &Val, b: &Val) -> bool {
 /// `class(name, defaults, methods)` — build a class descriptor.
 /// `name` is a string; `defaults` an object of default field values (or null);
 /// `methods` an object of functions (or null).
-fn oop_class(args: &[Val]) -> Result<Val, String> {
+pub(crate) fn oop_class(args: &[Val]) -> Result<Val, String> {
     at_least("class", args, 1)?;
     let name = expect_string("class", &args[0])?;
     let defaults = args.get(1).cloned().unwrap_or_else(vnull);
@@ -1280,7 +1035,7 @@ fn oop_class(args: &[Val]) -> Result<Val, String> {
 
 /// `extend(parent, name, defaults, methods)` — derive a subclass, inheriting and
 /// overriding the parent's defaults and methods.
-fn oop_extend(args: &[Val]) -> Result<Val, String> {
+pub(crate) fn oop_extend(args: &[Val]) -> Result<Val, String> {
     at_least("extend", args, 2)?;
     let parent = args[0].clone();
     if parent.typ != 8 || object_typ(&parent) != CLASS_TYPE {
@@ -1304,7 +1059,7 @@ fn oop_extend(args: &[Val]) -> Result<Val, String> {
 /// `new(class, overrides?)` — instantiate a class. The instance starts from the
 /// class's (flattened) default fields, applies any `overrides` object, and is
 /// tagged with its class so `isInstance` / `method` work.
-fn oop_new(args: &[Val]) -> Result<Val, String> {
+pub(crate) fn oop_new(args: &[Val]) -> Result<Val, String> {
     at_least("new", args, 1)?;
     let class = args[0].clone();
     if class.typ != 8 || object_typ(&class) != CLASS_TYPE {
@@ -1340,7 +1095,7 @@ fn oop_new(args: &[Val]) -> Result<Val, String> {
 /// `method(instance, name)` — resolve a method through the inheritance chain and
 /// return the function value (the guest then calls it, passing the instance as
 /// the receiver). Returns null if unknown.
-fn oop_method(args: &[Val]) -> Result<Val, String> {
+pub(crate) fn oop_method(args: &[Val]) -> Result<Val, String> {
     arity("method", args, 2)?;
     let inst = &args[0];
     let mname = expect_string("method", &args[1])?;
@@ -1356,7 +1111,7 @@ fn oop_method(args: &[Val]) -> Result<Val, String> {
 
 /// `parentMethod(instance, name)` — resolve a method starting from the *parent*
 /// of the instance's class, enabling `super`-style dispatch.
-fn oop_parent_method(args: &[Val]) -> Result<Val, String> {
+pub(crate) fn oop_parent_method(args: &[Val]) -> Result<Val, String> {
     arity("parentMethod", args, 2)?;
     let inst = &args[0];
     let mname = expect_string("parentMethod", &args[1])?;
@@ -1382,7 +1137,7 @@ fn oop_parent_method(args: &[Val]) -> Result<Val, String> {
 /// `class` desugaring builds) for the method `name`, and returns it *bound* to
 /// `receiver` so the inherited body sees the right `this`. Returns null if the
 /// method is not found anywhere on the chain.
-fn super_method(args: &[Val]) -> Result<Val, String> {
+pub(crate) fn super_method(args: &[Val]) -> Result<Val, String> {
     arity("superMethod", args, 3)?;
     let mut proto = args[0].clone();
     let name = expect_string("superMethod", &args[1])?;
@@ -1408,7 +1163,7 @@ fn super_method(args: &[Val]) -> Result<Val, String> {
     Ok(vnull())
 }
 
-fn lookup_method(class: &Val, name: &str) -> Option<Val> {
+pub(crate) fn lookup_method(class: &Val, name: &str) -> Option<Val> {
     if class.typ != 8 {
         return None;
     }
@@ -1423,7 +1178,7 @@ fn lookup_method(class: &Val, name: &str) -> Option<Val> {
     None
 }
 
-fn is_instance_of(inst: &Val, class: &Val) -> bool {
+pub(crate) fn is_instance_of(inst: &Val, class: &Val) -> bool {
     if inst.typ != 8 || class.typ != 8 {
         return false;
     }
@@ -1449,7 +1204,7 @@ fn is_instance_of(inst: &Val, class: &Val) -> bool {
     false
 }
 
-fn object_typ(v: &Val) -> i64 {
+pub(crate) fn object_typ(v: &Val) -> i64 {
     if v.typ == 8 {
         v.as_object().borrow().typ
     } else {
@@ -1457,7 +1212,7 @@ fn object_typ(v: &Val) -> i64 {
     }
 }
 
-fn class_field(class: &Val, key: &str) -> Val {
+pub(crate) fn class_field(class: &Val, key: &str) -> Val {
     class
         .as_object()
         .borrow()
@@ -1470,7 +1225,7 @@ fn class_field(class: &Val, key: &str) -> Val {
 
 /// Ensure a value is an object (turning null into an empty object), for the
 /// `defaults` / `methods` slots of a class.
-fn normalize_object(v: Val) -> Val {
+pub(crate) fn normalize_object(v: Val) -> Val {
     if v.typ == 8 {
         v
     } else {
@@ -1479,7 +1234,7 @@ fn normalize_object(v: Val) -> Val {
 }
 
 /// Shallow merge of two object-or-null values; `b` overrides `a`.
-fn merge_objects(a: Val, b: Val) -> Val {
+pub(crate) fn merge_objects(a: Val, b: Val) -> Val {
     let mut m: ValMap = ValMap::default();
     if a.typ == 8 {
         for (k, v) in a.as_object().borrow().data.data.iter() {
@@ -1496,7 +1251,7 @@ fn merge_objects(a: Val, b: Val) -> Val {
 
 /// Fresh copy of a value used when seeding instance fields from class defaults,
 /// so two instances never alias the same mutable container.
-fn copy_value(v: &Val) -> Val {
+pub(crate) fn copy_value(v: &Val) -> Val {
     match v.typ {
         8 => {
             let src = v.as_object();

@@ -87,7 +87,9 @@ impl DartRuntime {
     ) -> Result<Self, DartError> {
         let machine_id = machine_id.into();
         api::init_vm_system();
-        if !api::create_vm_from_js(machine_id.clone(), code.into()) {
+        // The JS front-end now lives in the `js2elpian` crate; it lowers to the
+        // Elpian AST and registers the VM through the VM's `from ast` path.
+        if !js2elpian::create_vm_from_js(machine_id.clone(), code.into()) {
             return Err(DartError::Compile);
         }
         Ok(DartRuntime {
@@ -111,7 +113,7 @@ impl DartRuntime {
     }
 
     /// Build a runtime from **Dart-subset source**, compiled to the VM's input
-    /// by the Phase 3 front-end ([`crate::dart_frontend`]). Runtime intrinsics
+    /// by the Phase 3 front-end (the `dart2elpian` crate). Runtime intrinsics
     /// are still reached via the `dart:*` host bridge.
     pub fn from_dart(
         machine_id: impl Into<String>,
@@ -120,7 +122,7 @@ impl DartRuntime {
         meter: ResourceMeter,
     ) -> Result<Self, DartError> {
         let (js, classes) =
-            crate::dart_frontend::transpile_program(dart_source).map_err(DartError::Frontend)?;
+            dart2elpian::transpile_program(dart_source).map_err(DartError::Frontend)?;
         let mut rt = Self::from_js(machine_id, js, caps, meter)?;
         // Register the declared class hierarchy so reified is/as checks work.
         for (name, superclass) in &classes {
