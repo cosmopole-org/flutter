@@ -1,5 +1,5 @@
 //! The **widget layer**: a Flutter-shaped widget framework, written in the Dart
-//! subset the front-end ([`crate::dart_frontend`]) compiles, so *real widget
+//! subset the front-end (the `dart2elpian` crate) compiles, so *real widget
 //! code* — `StatelessWidget`/`StatefulWidget` with `build()` methods and nested
 //! child widgets — runs on the Elpian VM and drives the `dart:ui` scene the
 //! engine rasterizes.
