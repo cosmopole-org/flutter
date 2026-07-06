@@ -87,7 +87,9 @@ impl DartRuntime {
     ) -> Result<Self, DartError> {
         let machine_id = machine_id.into();
         api::init_vm_system();
-        if !api::create_vm_from_js(machine_id.clone(), code.into()) {
+        // The JS front-end now lives in the `js2elpian` crate; it lowers to the
+        // Elpian AST and registers the VM through the VM's `from ast` path.
+        if !js2elpian::create_vm_from_js(machine_id.clone(), code.into()) {
             return Err(DartError::Compile);
         }
         Ok(DartRuntime {

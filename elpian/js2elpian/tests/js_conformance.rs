@@ -6,7 +6,7 @@ use elpian_vm::api;
 
 /// Compile JS, run its top-level program, then call `f()` and return the result.
 fn run(id: &str, js: &str) -> String {
-    assert!(api::create_vm_from_js(id.to_string(), js.to_string()), "JS should compile");
+    assert!(js2elpian::create_vm_from_js(id.to_string(), js.to_string()), "JS should compile");
     let _ = api::execute_vm(id.to_string());
     api::execute_vm_func(id.to_string(), "f".to_string(), 1).result_value
 }

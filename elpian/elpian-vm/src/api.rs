@@ -166,9 +166,10 @@ pub fn create_vm_from_ast(machine_id: String, ast_json: String) -> bool {
     true
 }
 
-/// Create a VM from **prebuilt bytecode** — the output of [`compile_js_to_bytecode`]
-/// / [`compiler::compile_ast`], produced at build time and shipped as an asset.
-/// This skips the JS/AST front-end entirely at run time: the deployed app loads
+/// Create a VM from **prebuilt bytecode** — the output of a source-language
+/// compiler's `compile_*_to_bytecode` (e.g. `js2elpian` / `dart2elpian`) or of
+/// [`compiler::compile_ast`], produced at build time and shipped as an asset.
+/// This skips any front-end entirely at run time: the deployed app loads
 /// bytecode straight into the executor (which decodes it once into its in-memory
 /// operation structure). Always succeeds — bytecode is already validated by the
 /// build-time compile.
@@ -178,36 +179,11 @@ pub fn create_vm_from_bytecode(machine_id: String, bytecode: Vec<u8>) -> bool {
     true
 }
 
-/// Compile JavaScript source to bytecode (the build-time half of the pipeline),
-/// so a tool can lower an app to bytecode once and ship the result. Returns the
-/// bytecode, or `None` if the source is outside the supported JS subset.
-pub fn compile_js_to_bytecode(code: &str) -> Option<Vec<u8>> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compiler::compile_js(code))).ok()
-}
-
 /// Create a VM directly from Elpian source code (uses the in-VM parser).
 pub fn create_vm_from_code(machine_id: String, code: String) -> bool {
     let vm = VM::compile_and_create_of_code(machine_id.clone(), code, 1, all_host_apis());
     VMS.lock().unwrap().insert(machine_id, vm);
     true
-}
-
-/// Create a VM from JavaScript source. The JS is lowered to Elpian AST JSON by
-/// the compiler module's built-in front-end and then compiled through the same
-/// `from ast` path as [`create_vm_from_ast`]. Returns `false` if the source is
-/// outside the supported JS subset (i.e. it fails to parse / compile).
-pub fn create_vm_from_js(machine_id: String, code: String) -> bool {
-    let id = machine_id.clone();
-    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        VM::compile_and_create_of_js(id, code, 1, all_host_apis())
-    }));
-    match built {
-        Ok(vm) => {
-            VMS.lock().unwrap().insert(machine_id, vm);
-            true
-        }
-        Err(_) => false,
-    }
 }
 
 /// Validate that an AST JSON string compiles, without registering a VM.
@@ -218,24 +194,6 @@ pub fn validate_ast(ast_json: String) -> bool {
     };
     compiler::compile_ast(ast_obj, 0);
     true
-}
-
-/// Validate that JavaScript source parses and compiles, without registering a
-/// VM. Returns `false` for source outside the supported subset.
-pub fn validate_js(code: String) -> bool {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = compiler::compile_js(&code);
-    }))
-    .is_ok()
-}
-
-/// Lower JavaScript source to its Elpian AST JSON (debug / tooling aid). On a
-/// parse error, returns a JSON object `{"error": "..."}` instead of the AST.
-pub fn compile_js_to_ast(code: String) -> String {
-    match compiler::try_parse_js(&code) {
-        Ok(ast) => ast.to_string(),
-        Err(e) => json!({ "error": e }).to_string(),
-    }
 }
 
 /// Execute a VM's top-level program.
