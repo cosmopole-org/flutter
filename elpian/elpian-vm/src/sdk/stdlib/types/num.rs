@@ -1,5 +1,11 @@
 //! `Num` methods — the members callable on a num value, grouped by the type
 //! they relate to. Dispatched here from `stdlib::invoke` for any `Num.<m>` call.
+//!
+//! The operations that share the core builtins' exact semantics (`floor`,
+//! `ceil`, `round`, `isNaN`, `clamp`) delegate to that single implementation via
+//! the parent `stdlib::invoke`. The rest keep bespoke logic because they carry
+//! the Dart-specific `int`/`double` distinction the collapsing math builtins
+//! deliberately do not (e.g. `(-3.0).abs()` must stay a `double`).
 
 use crate::sdk::data::*;
 use crate::sdk::stdlib::*;
@@ -7,6 +13,14 @@ use crate::sdk::stdlib::*;
 /// Invoke `Num.<method>` on `args[0]` (the receiver) plus trailing arguments.
 pub(crate) fn invoke(name: &str, method: &str, args: &[Val]) -> Result<Val, String> {
     match method {
+        // ---- delegated to the single canonical builtin implementation ------
+        "floor" => super::super::invoke("floor", args),
+        "ceil" => super::super::invoke("ceil", args),
+        "round" => super::super::invoke("round", args),
+        "isNaN" => super::super::invoke("isNaN", args),
+        "clamp" => super::super::invoke("clamp", args),
+
+        // ---- members carrying the Dart int/double distinction --------------
         "toInt" => Ok(vi64(as_num(&args[0])?.trunc() as i64)),
         "toDouble" => Ok(vf64(as_num(&args[0])?)),
         "abs" => {
@@ -16,10 +30,6 @@ pub(crate) fn invoke(name: &str, method: &str, args: &[Val]) -> Result<Val, Stri
                 Ok(vf64(as_num(&args[0])?.abs()))
             }
         }
-        "floor" => Ok(vi64(as_num(&args[0])?.floor() as i64)),
-        "ceil" => Ok(vi64(as_num(&args[0])?.ceil() as i64)),
-        "round" => Ok(vi64(as_num(&args[0])?.round() as i64)),
-        "isNaN" => Ok(vbool(as_num(&args[0])?.is_nan())),
         "isNegative" => Ok(vbool(as_num(&args[0])? < 0.0)),
         "toString" => {
             if matches!(args[0].typ, 1 | 2 | 3) {
@@ -35,13 +45,7 @@ pub(crate) fn invoke(name: &str, method: &str, args: &[Val]) -> Result<Val, Stri
             let k = as_int(&args[1])? as usize;
             Ok(vstr(format!("{d:.*}", k)))
         }
-        "clamp" => {
-            at_least(name, args, 3)?;
-            let (x, lo, hi) = (as_num(&args[0])?, as_num(&args[1])?, as_num(&args[2])?);
-            Ok(num_result(x.max(lo).min(hi)))
-        }
 
-        // ---- more List methods --------------------------------------------
         _ => Err(format!("unknown builtin '{name}'")),
     }
 }

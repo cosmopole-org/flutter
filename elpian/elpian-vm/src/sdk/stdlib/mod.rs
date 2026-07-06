@@ -371,9 +371,10 @@ pub fn invoke(name: &str, args: &[Val]) -> Result<Val, String> {
         // ---- foundation: reflection / conversion ---------------------------
         "typeOf" => {
             arity(name, args, 1)?;
-            // JavaScript has a single `number` type; the VM's distinct numeric
-            // representations (i16..f64) all report as `number`, with `number`
-            // itself aliased onto f64.
+            // `typeOf` exposes a single unified `number` type: the VM's distinct
+            // numeric representations (i16..f64) all report as `number`. A
+            // front-end whose language distinguishes int/double inspects the
+            // value tag directly instead.
             let t = match args[0].typ {
                 1..=5 => "number",
                 _ => type_name(&args[0]),
@@ -1451,6 +1452,42 @@ mod tests {
         invoke("push", &[a_tags, vi64(1)]).unwrap();
         let b_tags = invoke("field", &[b, vstr("tags".into())]).unwrap();
         assert_eq!(b_tags.as_array().borrow().data.len(), 0, "instance b unaffected");
+    }
+
+    #[test]
+    fn type_methods_delegate_to_the_single_builtin_implementation() {
+        // The Dart-style member surface (`List.contains`, `String.toUpperCase`,
+        // `Map.containsKey`, `Num.floor`) and the functional builtin surface
+        // (`contains`, `upper`, `has`, `floor`) must resolve to the *same*
+        // implementation, so results are identical for the same operation.
+        let list = varr(vec![vi64(1), vi64(2), vi64(3)]);
+        assert_eq!(
+            invoke("List.contains", &[list.clone(), vi64(2)]).unwrap().as_bool(),
+            invoke("contains", &[list.clone(), vi64(2)]).unwrap().as_bool(),
+        );
+        // Regression: `List.contains` used to compare by stringification; it now
+        // shares the builtin's value equality, so an int matches by value.
+        assert!(invoke("List.contains", &[list, vi64(2)]).unwrap().as_bool());
+
+        assert_eq!(
+            invoke("String.toUpperCase", &[vstr("abc".into())]).unwrap().as_string(),
+            invoke("upper", &[vstr("abc".into())]).unwrap().as_string(),
+        );
+
+        let map = vobj(-2, {
+            let mut m = ValMap::default();
+            m.insert("k".into(), vi64(9));
+            m
+        });
+        assert_eq!(
+            invoke("Map.containsKey", &[map.clone(), vstr("k".into())]).unwrap().as_bool(),
+            invoke("has", &[map, vstr("k".into())]).unwrap().as_bool(),
+        );
+
+        assert_eq!(
+            invoke("Num.floor", &[vf64(3.7)]).unwrap().as_i64(),
+            invoke("floor", &[vf64(3.7)]).unwrap().as_i64(),
+        );
     }
 
     #[test]

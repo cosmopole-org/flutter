@@ -1,5 +1,13 @@
 //! `List` methods — the members callable on a list value, grouped by the type
 //! they relate to. Dispatched here from `stdlib::invoke` for any `List.<m>` call.
+//!
+//! This layer is an **adapter**, not a second implementation: every operation
+//! that also exists as a core builtin (`contains`, `indexOf`, `join`, `first`,
+//! `last`, …) delegates to that single canonical implementation via the parent
+//! `stdlib::invoke`, so a list operation behaves identically whether it is
+//! reached as a bare builtin call (the functional surface one front-end lowers
+//! to) or as a `list.method(...)` member call (the surface another lowers to).
+//! Only members with no builtin equivalent carry their own logic here.
 
 use crate::sdk::data::*;
 use crate::sdk::stdlib::*;
@@ -7,6 +15,23 @@ use crate::sdk::stdlib::*;
 /// Invoke `List.<method>` on `args[0]` (the receiver) plus trailing arguments.
 pub(crate) fn invoke(name: &str, method: &str, args: &[Val]) -> Result<Val, String> {
     match method {
+        // ---- delegated to the single canonical builtin implementation ------
+        "contains" => super::super::invoke("contains", args),
+        "indexOf" => super::super::invoke("indexOf", args),
+        "first" => super::super::invoke("first", args),
+        "last" => super::super::invoke("last", args),
+        "join" => {
+            // Dart's separator is optional (defaults to ""); the canonical `join`
+            // builtin takes it positionally, so supply the default when omitted.
+            if args.len() < 2 {
+                let recv = args.first().cloned().unwrap_or_else(|| varr(vec![]));
+                super::super::invoke("join", &[recv, vstr(String::new())])
+            } else {
+                super::super::invoke("join", args)
+            }
+        }
+
+        // ---- members unique to the List surface ----------------------------
         "add" => {
             at_least(name, args, 2)?;
             args[0].as_array().borrow_mut().data.push(args[1].clone());
@@ -15,36 +40,6 @@ pub(crate) fn invoke(name: &str, method: &str, args: &[Val]) -> Result<Val, Stri
         "removeLast" => {
             let popped = args[0].as_array().borrow_mut().data.pop();
             Ok(popped.unwrap_or_else(|| Val::new(0, Payload::Null)))
-        }
-        "first" => {
-            let a = args[0].as_array();
-            let out = a.borrow().data.first().cloned();
-            Ok(out.unwrap_or_else(|| Val::new(0, Payload::Null)))
-        }
-        "last" => {
-            let a = args[0].as_array();
-            let out = a.borrow().data.last().cloned();
-            Ok(out.unwrap_or_else(|| Val::new(0, Payload::Null)))
-        }
-        "contains" => {
-            at_least(name, args, 2)?;
-            let target = args[1].stringify();
-            let a = args[0].as_array();
-            let found = a.borrow().data.iter().any(|e| e.stringify() == target);
-            Ok(vbool(found))
-        }
-        "indexOf" => {
-            at_least(name, args, 2)?;
-            let target = args[1].stringify();
-            let a = args[0].as_array();
-            let idx = a
-                .borrow()
-                .data
-                .iter()
-                .position(|e| e.stringify() == target)
-                .map(|i| i as i64)
-                .unwrap_or(-1);
-            Ok(vi64(idx))
         }
         "sublist" => {
             at_least(name, args, 2)?;
@@ -57,18 +52,6 @@ pub(crate) fn invoke(name: &str, method: &str, args: &[Val]) -> Result<Val, Stri
             }
             .max(start);
             Ok(varr(b.data[start..end].to_vec()))
-        }
-        "join" => {
-            let a = args[0].as_array();
-            let sep = args.get(1).map(|v| v.as_string()).unwrap_or_default();
-            let joined = a
-                .borrow()
-                .data
-                .iter()
-                .map(|e| if e.typ == 7 { e.as_string() } else { e.stringify() })
-                .collect::<Vec<_>>()
-                .join(&sep);
-            Ok(vstr(joined))
         }
         "addAll" => {
             at_least(name, args, 2)?;
@@ -101,12 +84,13 @@ pub(crate) fn invoke(name: &str, method: &str, args: &[Val]) -> Result<Val, Stri
             Ok(Val::new(0, Payload::Null))
         }
         "reversed" => {
+            // Dart's `reversed` yields a *new* sequence without mutating the
+            // receiver, so it cannot delegate to the in-place `reverse` builtin.
             let mut v = args[0].as_array().borrow().data.clone();
             v.reverse();
             Ok(varr(v))
         }
 
-        // ---- Map methods (receiver is a plain object) ----------------------
         _ => Err(format!("unknown builtin '{name}'")),
     }
 }

@@ -5400,8 +5400,8 @@ impl Executor {
                                 }
                             }
                         } else if target_type == "f64" || target_type == "number" {
-                            // `number` is the JavaScript numeric type, aliased onto
-                            // the f64 representation.
+                            // `number` is the VM's unified numeric type name,
+                            // aliased onto the f64 representation.
                             match data.typ {
                                 1 => {
                                     main_reg = Some(Val {
