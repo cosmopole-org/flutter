@@ -13,16 +13,25 @@ targets the Dart VM cannot serve dynamically.
   host calls back to the embedder. **It never generates machine code** → no W^X
   violation (App-Store-legal) and it compiles to `wasm32`. It already ships a
   first-class capability + resource-limit governor.
-- **`elpian-dart/`** — new. The Dart runtime layer: it drives an Elpian VM and
-  services the `dart:*` **foundational ("group 3") libraries** — the native
-  surfaces the Flutter framework depends on — as governed host-bridge calls.
+- **`js2elpian/` · `dart2elpian/`** — the language front-ends. Each compiles its
+  source language (JavaScript / a Dart subset) to Elpian bytecode; the VM is the
+  single, unified execution target. Dart-specific semantics — the `~/` and `??`
+  operators, reified `is`/`as`, the int/double numeric split, and the
+  JSON/UTF-8/Base64 codecs — are **native to the VM**, not front-end shims.
+- **`dart/`** — the *optional* Dart/Flutter host surface: it drives an Elpian VM
+  and services the `dart:*` **foundational ("group 3") libraries** — the native
+  surfaces the Flutter framework depends on (`dart:ui`, `dart:typed_data`,
+  `dart:isolate`, …) plus the widget layer — as governed host-bridge calls. It
+  is gated behind the `dart` cargo feature (the `--include-dart` switch): a VM
+  build that does not want the Dart extras simply omits it.
 
-Both crates build and test on native **and** `wasm32-unknown-unknown`:
+The crates build and test on native **and** `wasm32-unknown-unknown`:
 
 ```sh
 cd elpian
-cargo test                                   # 20 tests, all green
-cargo build -p elpian-dart --target wasm32-unknown-unknown --release   # web/iOS-shape build
+cargo test                                             # full suite, all green
+cargo build -p dart --target wasm32-unknown-unknown --release              # with Dart extras
+cargo build -p dart --no-default-features --target wasm32-unknown-unknown   # VM-only, no Dart
 ```
 
 ## Why this architecture (and not "run Dart on Elpian directly")
@@ -54,7 +63,7 @@ Every `dart:*` call passes through both:
    (`Gpu`, `Network`, `Storage`, `Clock`, `Randomness`, `Other`, …) plus its
    instruction / memory / call-depth limits. A disabled family short-circuits a
    call to a typed null before it reaches this crate.
-2. **Dart layer** (`elpian-dart/src/governance.rs`) — a finer
+2. **Dart layer** (`dart/src/governance.rs`) — a finer
    [`DartCapability`] per library (`Painting`, `TypedData`, `Io`, `Isolate`,
    `Ffi`, `Environment`), *fails closed* for unknown libraries, plus a
    [`ResourceMeter`] bounding host-call count and bytes moved across the seam.
@@ -163,7 +172,7 @@ by build order). The `engine/.../elpian` layer exposes `LoadWidgetApp` /
 
 **Phase 7 — the `flutter.dart` library ✅.** A large, **idiomatic** Flutter
 widget/painting library authored as ordinary Dart in
-[`flutter/flutter.dart`](elpian-dart/flutter/flutter.dart) and modelled on the
+[`flutter/flutter.dart`](dart/flutter/flutter.dart) and modelled on the
 real framework's public API — `Key`, `Widget`/`StatelessWidget`/`StatefulWidget`/
 `State`, `BuildContext`; the painting value types `Color`/`Colors`/`Offset`/
 `Size`/`Rect`/`EdgeInsets`/`Alignment`/`BorderRadius`/`BoxDecoration`/`TextStyle`/

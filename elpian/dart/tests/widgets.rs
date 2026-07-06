@@ -1,11 +1,12 @@
+#![cfg(feature = "dart")]
 //! End-to-end tests for the **widget layer**: real Flutter-style widget code —
 //! `StatelessWidget`/`StatefulWidget` with `build()` and nested children — is
 //! compiled by the front-end, run on the Elpian VM, laid out, and painted into
 //! the `dart:ui` scene the engine rasterizes; taps re-enter the guest, mutate
 //! `State`, and the next frame reflects it.
 
-use elpian_dart::binding::{PointerEvent, PointerPhase};
-use elpian_dart::{DartCapabilitySet, DartRuntime, ResourceMeter};
+use dart::binding::{PointerEvent, PointerPhase};
+use dart::{DartCapabilitySet, DartRuntime, ResourceMeter};
 use serde_json::Value;
 
 fn app(machine_id: &str, source: &str) -> DartRuntime {

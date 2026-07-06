@@ -78,8 +78,9 @@ pub fn transpile(dart: &str) -> Result<String, String> {
     Ok(transpile_program(dart)?.0)
 }
 
-/// A declared class and its optional superclass (for building a runtime
-/// `elpian_dart::types::ClassTable`).
+/// A declared class and its optional superclass. Retained for callers that want
+/// the source-declared hierarchy; the VM itself answers reified `is`/`as`
+/// natively from each instance's prototype chain, so no external table is needed.
 pub type ClassInfo = (String, Option<String>);
 
 /// Transpile and also return the declared class hierarchy, so the runtime can
