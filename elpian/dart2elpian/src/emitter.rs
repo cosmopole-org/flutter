@@ -607,11 +607,15 @@ impl Emitter {
                     format!("{{{}}}", pairs.join(", "))
                 }
             }
+            // Reified `is` / `as` are native VM operations, reached through the
+            // `__isType` / `__asType` compiler intrinsics (which js2elpian lowers
+            // to the type-test opcode) rather than a host round-trip. The type is
+            // erased to its base name — the reified check is by base type / class.
             Expr::Is(x, ty) => {
-                format!("askHost(\"dart:core/isType\", [{}, {}])", self.emit_expr(x), json_string(ty))
+                format!("__isType({}, {})", self.emit_expr(x), json_string(ty))
             }
             Expr::As(x, ty) => {
-                format!("askHost(\"dart:core/asType\", [{}, {}])", self.emit_expr(x), json_string(ty))
+                format!("__asType({}, {})", self.emit_expr(x), json_string(ty))
             }
             Expr::Call(callee, pos, named) => {
                 if let Expr::Ident(name) = &**callee {

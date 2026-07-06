@@ -99,6 +99,10 @@ pub enum UnitKind {
     Conditional { alt_start: usize, end: usize },
     /// `0xfd` — `cast` of the following value expression to `target_type`.
     Cast { target_type: Rc<str> },
+    /// `0xed` — reified type test of the following value expression against
+    /// `type_name`. `cast` false is `is` (yields a bool); `cast` true is `as`
+    /// (yields the value, trapping on a mismatch).
+    TypeTest { type_name: Rc<str>, cast: bool },
     /// `0xf0..=0xfb` — an arithmetic / comparison operator, normalised to the
     /// `1..=12` id the interpreter switches on.
     Arith(i16),
@@ -392,6 +396,16 @@ impl<'a> Decoder<'a> {
                 let after_val = self.decode_value(pos + 1);
                 let (ty, consumed) = self.read_str(after_val);
                 self.units[idx] = UnitKind::Cast { target_type: Rc::from(ty.as_str()) };
+                after_val + consumed
+            }
+            0xed => {
+                // Reified type test: opcode, cast flag, value expression, then the
+                // type-name string, folded into the unit.
+                let cast = self.bytes[pos + 1] == 1;
+                let idx = self.emit(pos, UnitKind::TypeTest { type_name: Rc::from(""), cast });
+                let after_val = self.decode_value(pos + 2);
+                let (ty, consumed) = self.read_str(after_val);
+                self.units[idx] = UnitKind::TypeTest { type_name: Rc::from(ty.as_str()), cast };
                 after_val + consumed
             }
             0xf0..=0xfb => {

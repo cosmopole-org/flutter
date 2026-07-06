@@ -174,6 +174,18 @@ mod tests {
     }
 
     #[test]
+    fn is_and_as_emit_native_intrinsics_not_host_calls() {
+        // Reified `is`/`as` lower to the `__isType`/`__asType` compiler intrinsics
+        // (native VM opcode), not a `dart:core/isType` host round-trip. Generics
+        // are erased to the base type name.
+        let js = transpile("var a = x is List<int>; var b = y as Foo;").unwrap();
+        assert!(js.contains("__isType(x, \"List\")"), "is -> intrinsic: {js}");
+        assert!(js.contains("__asType(y, \"Foo\")"), "as -> intrinsic: {js}");
+        assert!(!js.contains("isType\""), "no isType host round-trip: {js}");
+        assert!(!js.contains("asType\""), "no asType host round-trip: {js}");
+    }
+
+    #[test]
     fn null_coalescing_emits_native_operator() {
         // `??` is a native short-circuiting VM operator now, not a helper call.
         let js = transpile("var x = a ?? 5;").unwrap();

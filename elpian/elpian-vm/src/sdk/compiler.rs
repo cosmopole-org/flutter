@@ -92,6 +92,18 @@ fn serialize_expr(val: serde_json::Value) -> Vec<u8> {
             result.append(&mut i32::to_be_bytes(tt_bytes.len() as i32).to_vec());
             result.append(&mut tt_bytes);
         }
+        "typeTest" => {
+            // Reified `is` / `as`. Layout: [0xed][cast flag][value][type name].
+            // `cast` is 0 for `is` (yields a bool) and 1 for `as` (yields the
+            // value, trapping on a mismatch). The type name is the base type as a
+            // length-prefixed string.
+            result.push(0xed);
+            result.push(if val["data"]["cast"].as_bool().unwrap_or(false) { 1 } else { 0 });
+            result.append(&mut serialize_expr(val["data"]["value"].clone()));
+            let type_bytes = val["data"]["typeName"].as_str().unwrap_or("").as_bytes().to_vec();
+            result.append(&mut i32::to_be_bytes(type_bytes.len() as i32).to_vec());
+            result.append(&mut type_bytes.clone());
+        }
         "object" => {
             result.push(8);
             result.append(&mut i64::to_be_bytes(-2).to_vec());
@@ -375,7 +387,7 @@ fn collect_used(node: &Value, used: &mut std::collections::BTreeSet<String>) {
             collect_used(&node["data"]["consequent"], used);
             collect_used(&node["data"]["alternate"], used);
         }
-        "not" | "cast" => collect_used(&node["data"]["value"], used),
+        "not" | "cast" | "typeTest" => collect_used(&node["data"]["value"], used),
         "definition" => collect_used(&node["data"]["rightSide"], used),
         "assignment" => {
             collect_used(&node["data"]["leftSide"], used);

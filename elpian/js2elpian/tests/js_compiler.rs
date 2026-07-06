@@ -505,3 +505,30 @@ fn null_coalescing_operator() {
         function f() { var a = 7; var r = a ?? side(); return r * 1000 + hit; }";
     assert_eq!(run_js_and_call("js-nc-3", js, "f"), "7000");
 }
+
+// ---- native reified type tests (is / as) via compiler intrinsics ------------
+
+#[test]
+fn reified_is_on_primitives() {
+    assert_eq!(run_js_and_call("js-is-int", "function f() { return __isType(5, \"int\"); }", "f"), "true");
+    assert_eq!(run_js_and_call("js-is-str", "function f() { return __isType(5, \"String\"); }", "f"), "false");
+    assert_eq!(run_js_and_call("js-is-list", "function f() { return __isType([1], \"List\"); }", "f"), "true");
+    // `as` yields the value on a successful check.
+    assert_eq!(run_js_and_call("js-as-num", "function f() { return __asType(42, \"num\"); }", "f"), "42");
+}
+
+#[test]
+fn reified_is_walks_class_hierarchy() {
+    // A subclass instance `is` both its own class and every ancestor, and is not
+    // an unrelated class — resolved natively from the instance's prototype chain.
+    let js = "
+        class Animal { constructor() {} }
+        class Dog extends Animal { constructor() { super(); } }
+        function f() {
+            let d = new Dog();
+            let a = __isType(d, \"Dog\") && __isType(d, \"Animal\");
+            let b = __isType(d, \"Cat\");
+            return a && !b;
+        }";
+    assert_eq!(run_js_and_call("js-is-class", js, "f"), "true");
+}

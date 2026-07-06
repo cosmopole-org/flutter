@@ -31,6 +31,7 @@ pub enum OperationTypes {
     ArrExpr,
     CondBrch,
     CastOprt,
+    TypeTest,
     Logical,
     Conditional,
     Dummy,
@@ -84,6 +85,8 @@ pub enum ExecStates {
     CondBranchFinished,
     CastOprtStarted,
     CastOprtFinished,
+    TypeTestStarted,
+    TypeTestFinished,
     LogicalExtractOp1,
     LogicalExtractOp2,
     CondExprExtractCond,
@@ -1087,6 +1090,115 @@ impl Operation for CastOp {
                 data: Payload::from(self.target_type.clone()),
             },
         ]
+    }
+}
+
+/// Reified `is` / `as`. The value expression is evaluated first; the finalizer
+/// then tests it against `type_name` (`cast` false = `is`, yielding a bool;
+/// `cast` true = `as`, yielding the value or trapping on a mismatch). The type
+/// name is folded into the unit at decode, exactly like [`CastOp`]'s target.
+struct TypeTestOp {
+    typ: OperationTypes,
+    state: ExecStates,
+    value: Option<Val>,
+    type_name: String,
+    cast: bool,
+}
+
+impl TypeTestOp {
+    pub fn new(type_name: String, cast: bool) -> Self {
+        TypeTestOp {
+            typ: OperationTypes::TypeTest,
+            state: ExecStates::TypeTestStarted,
+            value: None,
+            type_name,
+            cast,
+        }
+    }
+}
+
+impl Operation for TypeTestOp {
+    fn get_state(&self) -> ExecStates {
+        self.state
+    }
+    fn get_type(&self) -> OperationTypes {
+        self.typ
+    }
+    fn set_state(&mut self, state: ExecStates, data: StateData) {
+        self.state = state;
+        if state == ExecStates::TypeTestFinished {
+            self.value = Some(data.val());
+        }
+    }
+    fn get_data(&self) -> Vec<Val> {
+        vec![
+            self.value.clone().unwrap(),
+            Val { typ: 7, data: Payload::from(self.type_name.clone()) },
+            Val { typ: 6, data: Payload::from(self.cast) },
+        ]
+    }
+}
+
+/// Reified type test: does `value` have (dynamic) type `type_name`? Primitive
+/// type names are matched against the value's type tag; a class name is matched
+/// by walking the instance's prototype chain (`__proto` → `__parent`), each
+/// prototype carrying its `__class_name`, so the class hierarchy embedded in the
+/// value answers the check with no external class table. This is the native
+/// replacement for the `dart:core/isType` host round-trip.
+///
+/// Because the front-ends model an absent value as `0` (no first-class null),
+/// the numeric checks accept that representation just as the previous host
+/// implementation did over the JSON bridge.
+fn value_is_type(value: &Val, type_name: &str) -> bool {
+    match type_name {
+        "dynamic" | "Object" => value.typ != 0,
+        "int" => matches!(value.typ, 1 | 2 | 3),
+        "double" => matches!(value.typ, 4 | 5),
+        "num" => matches!(value.typ, 1..=5),
+        "String" => value.typ == 7,
+        "bool" => value.typ == 6,
+        "List" => value.typ == 9,
+        "Map" => value.typ == 8,
+        "Function" => value.typ == 10,
+        "Null" => value.typ == 0,
+        class => {
+            if value.typ != 8 {
+                return false;
+            }
+            // Walk the prototype chain, comparing each level's class name. Both the
+            // js2elpian/dart2elpian `__proto`→`__parent` prototype scheme and the
+            // stdlib `class`/`new` `__class`→`__parent` scheme are handled: each
+            // prototype/class carries a `__class_name` string.
+            let mut cur = {
+                let inst = value.as_object();
+                let b = inst.borrow();
+                b.data
+                    .data
+                    .get("__proto")
+                    .or_else(|| b.data.data.get("__class"))
+                    .cloned()
+            };
+            // A directly-tagged instance (`__class_name` on the object itself).
+            if let Some(name) = value.as_object().borrow().data.data.get("__class_name") {
+                if name.typ == 7 && name.as_string() == class {
+                    return true;
+                }
+            }
+            while let Some(proto) = cur {
+                if proto.typ != 8 {
+                    break;
+                }
+                let b = proto.as_object();
+                let bref = b.borrow();
+                if let Some(name) = bref.data.data.get("__class_name") {
+                    if name.typ == 7 && name.as_string() == class {
+                        return true;
+                    }
+                }
+                cur = bref.data.data.get("__parent").cloned();
+            }
+            false
+        }
     }
 }
 
@@ -4276,6 +4388,22 @@ impl Executor {
                                     == ExecStates::CastOprtFinished;
                             continue;
                         }
+                    } else if op_type == OperationTypes::TypeTest {
+                        if self.registers.last().unwrap().get_state()
+                            == ExecStates::TypeTestStarted
+                        {
+                            // The value just evaluated; the type name + mode are
+                            // already folded into the operation.
+                            self.registers.last_mut().unwrap().set_state(
+                                ExecStates::TypeTestFinished,
+                                StateData::Val(main_reg.take().unwrap()),
+                            );
+                            main_reg = None;
+                            is_reg_state_final =
+                                self.registers.last().unwrap().get_state()
+                                    == ExecStates::TypeTestFinished;
+                            continue;
+                        }
                     } else if op_type == OperationTypes::Logical {
                         let state = self.registers.last().unwrap().get_state();
                         if state == ExecStates::LogicalExtractOp1 {
@@ -5019,6 +5147,29 @@ impl Executor {
                         is_reg_state_final = false;
                         continue;
                     } else if self.registers.last().unwrap().get_state()
+                        == ExecStates::TypeTestFinished
+                    {
+                        let regs = self.registers.last().unwrap().get_data();
+                        let value = regs[0].clone();
+                        let type_name = regs[1].as_string();
+                        let cast = regs[2].as_bool();
+                        self.registers.pop();
+                        let matches = value_is_type(&value, &type_name);
+                        if cast {
+                            // `as`: yield the value on a match, trap on a mismatch —
+                            // Dart's checked-cast semantics.
+                            if matches {
+                                main_reg = Some(value);
+                            } else {
+                                panic!("elpian error: TypeError: value is not a {type_name}");
+                            }
+                        } else {
+                            // `is`: the boolean result of the type test.
+                            main_reg = Some(Val { typ: 6, data: Payload::from(matches) });
+                        }
+                        is_reg_state_final = false;
+                        continue;
+                    } else if self.registers.last().unwrap().get_state()
                         == ExecStates::CastOprtFinished
                     {
                         let regs = self.registers.last().unwrap().get_data();
@@ -5533,6 +5684,10 @@ impl Executor {
                 // cast operation (target type folded into the unit)
                 UnitKind::Cast { target_type } => {
                     self.registers.push(Box::new(CastOp::new(target_type.to_string())));
+                }
+                // reified type test `is` / `as` (type name + mode folded in)
+                UnitKind::TypeTest { type_name, cast } => {
+                    self.registers.push(Box::new(TypeTestOp::new(type_name.to_string(), cast)));
                 }
                 // ----------------------------------
                 // program operators:
